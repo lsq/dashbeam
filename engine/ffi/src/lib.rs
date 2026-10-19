@@ -11,7 +11,7 @@ use protocol::{
     AddrInfoOptions, AppHandle, DiscoveryModeOption, EventEmitter, FileMetadata,
     RelayModeOption, SendOptions,
 };
-use native::{start_share_items, SendResult};
+use native::{start_share_items, SendResult, ShareItem};
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -70,9 +70,19 @@ struct FfiSendOptions {
     ipv6_addr: Option<String>,
     /// 可选文件元数据（直接透传 protocol::FileMetadata 的 serde 形状）
     metadata: Option<FileMetadata>,
+
+    // ---- NEW: 透明显示名（透明加密场景）----------------------------------
+    /// 与 paths 平行的显示名数组：display_names[i] 是 paths[i] 在接收端
+    /// 看到的根条目名。数组可短于 paths，缺失/null 项用磁盘文件名。
+    /// 例: paths=["/d/x.iso.pdf"], display_names=["x.iso"]
+    display_names: Vec<Option<String>>,
+    /// 对所有条目的文件名剥离的后缀（大小写不敏感），如 ".pdf"。
+    /// 对文件条目剥根名；对目录条目递归剥其中每个文件的名字。
+    /// 与 display_names 同时存在时，display_names 优先（直接覆盖根名）。
+    strip_suffix: Option<String>,
 }
 
-fn map_options(o: FfiSendOptions) -> anyhow::Result<(SendOptions, Option<FileMetadata>)> {
+fn map_options(o: &FfiSendOptions) -> anyhow::Result<SendOptions> {
     let relay_mode = match o.relay_mode.as_str() {
         "" | "default" => RelayModeOption::Default,
         "disabled" => RelayModeOption::Disabled,
@@ -82,7 +92,7 @@ fn map_options(o: FfiSendOptions) -> anyhow::Result<(SendOptions, Option<FileMet
                 .iter()
                 .map(|s| iroh::RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("bad relay url {s}: {e}")))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            RelayModeOption::Custom { urls, auth_token: o.relay_auth_token }
+            RelayModeOption::Custom { urls, auth_token: o.relay_auth_token.clone() }
         }
         other => anyhow::bail!("unknown relay_mode: {other}"),
     };
@@ -95,7 +105,7 @@ fn map_options(o: FfiSendOptions) -> anyhow::Result<(SendOptions, Option<FileMet
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("custom discovery requires pkarr_relay_url"))
                 .and_then(|s| url::Url::parse(s).map_err(|e| anyhow::anyhow!("bad pkarr url: {e}")))?;
-            DiscoveryModeOption::Custom { pkarr_relay_url: url, dns_origin: o.dns_origin }
+            DiscoveryModeOption::Custom { pkarr_relay_url: url, dns_origin: o.dns_origin.clone(), }
         }
         other => anyhow::bail!("unknown discovery_mode: {other}"),
     };
@@ -120,10 +130,22 @@ fn map_options(o: FfiSendOptions) -> anyhow::Result<(SendOptions, Option<FileMet
         .transpose()
         .map_err(|e| anyhow::anyhow!("bad ipv6_addr: {e}"))?;
 
-    Ok((
+    Ok(
         SendOptions { relay_mode, discovery_mode, ticket_type, magic_ipv4_addr, magic_ipv6_addr },
-        o.metadata,
-    ))
+    )
+}
+
+/// NEW: 把 FFI 路径数组 + 显示名/剥后缀选项组装成 Vec<ShareItem>。
+fn build_items(path_list: Vec<PathBuf>, o: &FfiSendOptions) -> Vec<ShareItem> {
+    path_list
+        .into_iter()
+        .enumerate()
+        .map(|(i, path)| ShareItem {
+            path,
+            display_name: o.display_names.get(i).cloned().flatten(),
+            strip_suffix: o.strip_suffix.clone(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -193,16 +215,18 @@ pub extern "C" fn dashbeam_send_start(
             path_list.push(PathBuf::from(s));
         }
 
-        let (options, metadata) = if options_json.is_null() {
-            (SendOptions::default(), None)
+        let ffi_opts: FfiSendOptions = if options_json.is_null() {
+            FfiSendOptions::default()
         } else {
             let json = unsafe { CStr::from_ptr(options_json) }
                 .to_str()
                 .map_err(|e| anyhow::anyhow!("options not utf-8: {e}"))?;
-            let ffi_opts: FfiSendOptions = serde_json::from_str(json)
-                .map_err(|e| anyhow::anyhow!("bad options json: {e}"))?;
-            map_options(ffi_opts)?
+            serde_json::from_str(json)
+                .map_err(|e| anyhow::anyhow!("bad options json: {e}"))?
         };
+        let options = map_options(&ffi_opts)?;
+        let metadata = ffi_opts.metadata.clone();
+        let items = build_items(path_list, &ffi_opts);            // NEW
 
         let handle_id = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
 
@@ -223,7 +247,7 @@ pub extern "C" fn dashbeam_send_start(
                 }
             };
 
-            match start_share_items(path_list, options, &app_handle, metadata).await {
+            match start_share_items(items, options, &app_handle, metadata).await {
                 Ok(result) => {
                     let ready = serde_json::json!({
                         "handle": handle_id,

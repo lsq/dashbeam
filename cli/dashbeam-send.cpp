@@ -1,6 +1,11 @@
 // dashbeam-send: 通过 dashbeam_ffi.dll 分享文件/文件夹的命令行工具
-// 用法: dashbeam-send <文件或目录> [更多路径...]
-// 使用公共 iroh relay/discovery（默认），打印 ticket 供接收端使用。
+// 用法: dashbeam-send [--strip-suffix <后缀>] <文件或目录> [更多路径...]
+//
+// --strip-suffix .pdf: 接收端看到的文件名会剥掉 ".pdf" 后缀（大小写不敏感），
+//   磁盘上仍以原名读取 —— 用于透明加密环境（磁盘名 x.iso.pdf -> 对端 x.iso）。
+//   对目录条目递归生效。
+//
+// 默认使用公共 iroh relay/discovery + RelayAndAddresses ticket。
 
 #include <atomic>
 #include <chrono>
@@ -24,7 +29,6 @@ namespace fs = std::filesystem;
 static std::atomic<bool> g_ready{false};
 static std::atomic<bool> g_failed{false};
 static std::atomic<bool> g_quit{false};
-static std::atomic<int64_t> g_handle{-1};
 static int g_connected_peers = 0;
 
 static void on_event(const char *event, const char *payload, void *user_data) {
@@ -34,7 +38,6 @@ static void on_event(const char *event, const char *payload, void *user_data) {
     if (std::strcmp(event, "share-ready") == 0) {
         // payload: {"handle","ticket","hash","size","entry_type"}
         std::string json(p);
-        // 简单提取 ticket 字段（ticket 内不含引号/逗号）
         auto pos = json.find("\"ticket\":\"");
         if (pos != std::string::npos) {
             pos += 10;
@@ -77,7 +80,7 @@ static void on_event(const char *event, const char *payload, void *user_data) {
     } else if (std::strcmp(event, "transfer-failed") == 0) {
         std::printf("\n[transfer] 失败: %s\n", p);
     }
-    // "active-connection-count" 等事件太吵，不打印
+    // "active-connection-count" 太吵，不打印
 }
 
 #ifdef _WIN32
@@ -92,30 +95,99 @@ static BOOL WINAPI console_ctrl(DWORD type) {
 static void sigint_handler(int) { g_quit = true; }
 #endif
 
+// ---- 参数解析 --------------------------------------------------------------
+
+struct CliArgs {
+    std::string strip_suffix;          // 为空 = 不剥离
+    std::vector<std::string> paths;    // 位置参数：文件/目录
+};
+
+static void usage(const char *prog) {
+    std::fprintf(stderr,
+        "用法: %s [--strip-suffix <后缀>] <文件或目录> [更多路径...]\n"
+        "\n"
+        "选项:\n"
+        "  --strip-suffix <后缀>   接收端文件名剥离该后缀（如 .pdf），磁盘名不变\n"
+        "  -h, --help              显示本帮助\n",
+        prog);
+}
+
+// 返回 false = 解析失败或请求 help（已打印 usage）
+static bool parse_args(int argc, char **argv, CliArgs &out, bool &help) {
+    help = false;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+            help = true;
+            return false;
+        }
+        if (std::strcmp(a, "--strip-suffix") == 0) {
+            if (++i >= argc) {
+                std::fprintf(stderr, "--strip-suffix 缺少参数\n");
+                return false;
+            }
+            out.strip_suffix = argv[i];
+            // 允许 "pdf" 或 ".pdf" 两种写法，统一补点
+            if (!out.strip_suffix.empty() && out.strip_suffix[0] != '.')
+                out.strip_suffix = "." + out.strip_suffix;
+            continue;
+        }
+        if (std::strncmp(a, "--strip-suffix=", 15) == 0) {
+            out.strip_suffix = a + 15;
+            if (!out.strip_suffix.empty() && out.strip_suffix[0] != '.')
+                out.strip_suffix = "." + out.strip_suffix;
+            continue;
+        }
+        if (a[0] == '-' && a[1] != '\0') {
+            std::fprintf(stderr, "未知选项: %s\n", a);
+            return false;
+        }
+        out.paths.push_back(a);
+    }
+    return true;
+}
+
+// 最小 JSON 字符串转义（后缀里出现引号/反斜杠才需要）
+static std::string json_escape(const std::string &s) {
+    std::string r;
+    for (char c : s) {
+        switch (c) {
+            case '"':  r += "\\\""; break;
+            case '\\': r += "\\\\"; break;
+            default:   r += c;
+        }
+    }
+    return r;
+}
+
+// ---- main ------------------------------------------------------------------
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8); // 保证 ticket/中文输出不乱码
+    SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(console_ctrl, TRUE);
 #else
     std::signal(SIGINT, sigint_handler);
 #endif
 
-    if (argc < 2) {
-        std::fprintf(stderr,
-            "用法: %s <文件或目录> [更多路径...]\n"
-            "支持同时传入多个文件和文件夹，将打包为一次分享并输出 ticket。\n",
-            argv[0]);
+    CliArgs args;
+    bool help = false;
+    if (!parse_args(argc, argv, args, help) || args.paths.empty()) {
+        if (!help)
+            std::fprintf(stderr, "%s\n",
+                         help ? "" : "错误: 参数无效或没有提供任何路径\n");
+        usage(argv[0]);
         return 2;
     }
 
-    // 1. 校验并收集路径（文件或目录均可，与 GUI 的 start_share_items 一致）
+    // 1. 校验并收集路径（文件或目录均可）
     std::vector<std::string> storage;
     std::vector<const char *> paths;
-    for (int i = 1; i < argc; ++i) {
+    for (const auto &a : args.paths) {
         std::error_code ec;
-        fs::path p = fs::absolute(argv[i], ec);
+        fs::path p = fs::absolute(a, ec);
         if (ec || !fs::exists(p, ec)) {
-            std::fprintf(stderr, "路径不存在: %s\n", argv[i]);
+            std::fprintf(stderr, "路径不存在: %s\n", a.c_str());
             return 2;
         }
         storage.push_back(p.string());
@@ -123,19 +195,27 @@ int main(int argc, char **argv) {
         std::printf("添加: %s\n", storage.back().c_str());
     }
 
-    // 2. 启动分享。options_json=nullptr -> 公共 iroh relay + n0 discovery + Id ticket
-    const char *opts = R"({"ticket_type":"RelayAndAddresses"})";
+    // 2. 构造 options JSON：RelayAndAddresses ticket（避免 Id ticket 的
+    //    DNS 解析时序问题）+ 可选 strip_suffix
+    std::string opts = R"({"ticket_type":"RelayAndAddresses")";
+    if (!args.strip_suffix.empty()) {
+        opts += ",\"strip_suffix\":\"" + json_escape(args.strip_suffix) + "\"";
+        std::printf("strip-suffix: %s（接收端文件名将剥掉该后缀）\n",
+                    args.strip_suffix.c_str());
+    }
+    opts += "}";
+
+    // 3. 启动分享
     int64_t h = dashbeam_send_start(paths.data(), paths.size(),
-                                    opts, on_event, nullptr);
+                                    opts.c_str(), on_event, nullptr);
     if (h < 0) {
         const char *err = dashbeam_last_error();
         std::fprintf(stderr, "启动分享失败: %s\n", err ? err : "unknown");
         return 1;
     }
-    g_handle = h;
     std::printf("正在上线（公共 iroh relay）...\n");
 
-    // 3. 等待 share-ready / share-error（首次建 relay 连接可能需要十几秒）
+    // 4. 等待 share-ready / share-error
     for (int i = 0; i < 600 && !g_ready && !g_failed && !g_quit; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -146,7 +226,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 4. 保持分享会话存活，直到 Ctrl+C
+    // 5. 保持分享会话存活，直到 Ctrl+C
     while (!g_quit)
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 

@@ -48,6 +48,8 @@ typedef void (*dashbeam_event_cb)(const char *event,
  *   "ipv4_addr": "0.0.0.0:0",
  *   "ipv6_addr": "[::]:0",
  *   "metadata": {"file_name":"...","item_count":1,"size":123,...}
+ *   "display_names": ["x.iso", null, ...],  // 与 paths 平行，可选
+ *   "strip_suffix": ".pdf",                 // 递归剥离文件后缀，可选
  * }
  *
  * 返回 >0 的句柄；返回 -1 时调用 dashbeam_last_error() 取错误。

@@ -3,6 +3,7 @@ mod common;
 use common::TestFixture;
 use engine::{
     fetch_metadata, start_share, start_share_items, FileMetadata, ReceiveOptions, SendOptions,
+    ShareItem,
 };
 
 #[tokio::test]
@@ -58,7 +59,10 @@ async fn e2e_metadata_multi_item() {
     };
 
     let share = start_share_items(
-        vec![file_a, file_b],
+        vec![file_a, file_b]
+            .into_iter()
+            .map(ShareItem::plain)
+            .collect(),
         SendOptions::default(),
         &None,
         Some(metadata),
