@@ -4,9 +4,7 @@
 g++ -o dashbeam-send.exe -Iengine/ffi/include cli/dashbeam-send.cpp -L engine/target/release -ldashbeam_ffi
 ```
 
-#### DeepWiki
-
-# [DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam](https://deepwiki.com/search/senddllc_8fa0b884-9b06-497f-b855-1259478a3243)
+# DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam
 ## Q1
 怎么把send功能导出为dll，供c++项目调用
 ### Answer
@@ -1047,474 +1045,1254 @@ jobs:
 - **target 目录**：指定 `--target` 后 cargo 产物在 `target/<triple>/release/`，注意 `.lib` 路径相应变化。
 - **Release**：仅 tag（`v*`）触发，`contents: write` 权限已加。zip 命名如 `dashbeam-cli-windows-x64.zip`，里面 `dashbeam-send.exe` + `dashbeam_ffi.dll` + `dashbeam.h` 平铺，解压即用。
 - **注意**：arm64 的 `cl` 输出文件名不能直接叫 `dashbeam-send.exe`（runner 无法运行验证但编译没问题），stage 阶段统一改名是为了让 zip 包内文件名一致。如果 arm64 构建因依赖（如 ring/aws-lc-rs 类原生依赖）交叉编译失败，先从 matrix 里去掉 arm64，只保留 x64。
-
-
-# [DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam](https://deepwiki.com/search/_fa2cd547-e1e7-44fe-b0c9-cb5398a03939?mode=deep)
-## Q1
-传输界面速度展示逻辑
+## Q8
+在透明加密环境，如果主进程只有对pdf文件解密权限，那么通过在发送前把文件名重命名为带pdf扩展的文件名，导出的dashbeam_send_start才可以解密，但是接收端得到的文件名也是带pdf，需要相应重命名，有没有一个方式在磁盘上读取是带pdf扩展，发送给接收端不带pdf扩展名，比如
+1. 对普通文件比如x.iso，主程序会重命名为x.iso.pdf，start_share_items函数接收磁盘路径 + 显示名 2. 对文件夹，主程序也会递归重命名所有普通文件，start_share_items函数也只需要按1的规则就行
 ### Answer
-User asks in Chinese: "传输界面速度展示逻辑" — the logic for displaying transfer speed in the transfer UI. Search repo dashbeam.I have enough. Maybe quickly check how engine emits speed events — the SpeedMeter usage. Enough context to answer. Could check where record/emit happens, but can summarize. Let me quickly check the receiver side too? Keep it concise. Maybe grep for SpeedMeter usage.Look at send.rs usage briefly.Read relevant lines of send.rs and receive.rs around speed emission quickly — grep with context isn't available; use read_file? grep_search doesn't give line numbers. I have one iteration left. Read send.rs partially — but file may be large. Try reading targeted via read_file on progress.rs header (to get MIN_WINDOW_SECS, window size) plus send.rs matches location. Just read progress.rs fully (already saw most) and send.rs first ~120 lines? Better: read progress.rs lines 1-33 for constants, and send.rs around progress emit — can't know lines. Use read_file with send.rs first 200 lines and receive.rs similarly — two reads in parallel.Produce answer in Chinese explaining the speed display logic: engine-side sliding-window SpeedMeter, wire format, frontend parsing, UI rendering. Cite files/lines.传输速度展示由**引擎统一计算、前端只做渲染**的分层设计实现。核心原则是两端（发送方/接收方）用同一套算法算速度，前端不重新平滑或估算。
+User asks: can we send a file whose on-disk name is x.iso.pdf but receiver sees x.iso? Need to check how sendme-native names files in the share — likely uses file_name from path, or FileMetadata/file_name override exists? Earlier mentioned `metadata` field with FileMetadata {file_name, item_count, size...}. Check send.rs/progress.rs how names are derived and whether a display-name override exists.Need to see how import_paths names entries — engine/native/src/import.rs and whether names come from path file_name; also FileMetadata fields and how receive uses metadata/file_name. Read import.rs + protocol FileMetadata + receive naming.Read FileMetadata def in types.rs and how receive uses file_name/metadata to name output files — check engine/protocol/src/receive.rs relevant lines + types.rs FileMetadata.grep didn't show lines. Read protocol/types.rs FileMetadata and receive.rs name usage quickly — one iteration left, batch reads.Answer: yes, possible. The collection entry names are derived in `import_paths`/`collect_path_files` from `path.file_name()` and relative paths — so a "display name" indirection can be added. `FileMetadata.file_name` only affects preview/metadata (sent over METADATA_ALPN), not the actual exported filenames — actual filenames come from collection entry names (receiver iterates collection names). So the clean fix: extend `start_share_items`/`import_paths` to accept (disk_path, display_name) pairs; on disk it's x.iso.pdf, display name x.iso. For directories, need recursive mapping: strip .pdf suffix per file when building rel names. Approach: pass a name transform or explicit map.
 
-## 1. 引擎侧：`SpeedMeter` 滑动窗口测速
+Design proposal:
+1. In `import.rs`, change signature to accept `Vec<(PathBuf, String /*display root name*/)>` or add optional rename map `HashMap<PathBuf, String>`. In `collect_path_files`, root_name comes from display name; for dir entries, apply suffix-strip to each rel component.
+2. Simplest generic: add param `name_map: Option<fn>` — better: `Vec<ShareItem { path: PathBuf, display_name: Option<String> }>` where display_name overrides `file_name()`; and a global `strip_suffix` option (e.g. ".pdf") applied recursively to each file's relative path.
+3. FFI: extend options JSON or add `display_names` array parallel to paths, plus `strip_extension` field.
 
-`engine/protocol/src/progress.rs` 定义了共享的进度统计逻辑：
+Also caveat: receiving side names come purely from collection names — confirmed export uses collection names (import.rs names). FileMetadata.file_name used only for preview via METADATA_ALPN. So changing collection names suffices.
 
-- `SpeedMeter` 是一个**滑动窗口**测速器（默认窗口 `SPEED_WINDOW_SECS = 3.0` 秒），维护 `(时间, 累计字节数)` 样本队列。累计平均值会被慢启动拖垮、也不会在停顿时回落，所以改用窗口。 dashbeam:44-57 
-- `record()` 每次写入时清理超出窗口的旧样本。 dashbeam:59-71 
-- `bytes_per_sec_at(now_secs)` 用窗口首尾样本差值除以耗时计算速率；`now_secs` 会延伸到"当下"，所以传输卡顿时速度会自然衰减到 0。窗口耗时小于 `MIN_WINDOW_SECS = 0.1` 秒时返回 0，避免把发送缓冲区的瞬时突发当成真实速率。 dashbeam:75-87 dashbeam:12-22 
+Provide concrete diff-level code sketch for import.rs, send.rs, ffi lib.rs options, and CLI. Keep concise.可以实现，而且正好有一个干净的注入点：**接收端看到的文件名完全来自 collection 的条目名**，而条目名是在 `engine/native/src/import.rs` 里由 `path.file_name()`（`import.rs:28-32`）和目录相对路径（`import.rs:180-185`）生成的。`FileMetadata.file_name`（`engine/protocol/src/types.rs:127-137`）只是走 `METADATA_ALPN` 的预览元数据，**不决定落盘文件名**，所以只需改导入层的命名逻辑。
 
-- 速度只统计**用户 payload 字节**：`split_child_sizes` 把 hash-seq root 和集合元数据从计数字节中剔除（`FIRST_PAYLOAD_BLOB_INDEX = 2`），保证显示的速度反映实际文件传输而非协议开销。 dashbeam:8-31 
+## 方案：`ShareItem { disk_path, display_name }`
 
-## 2. 事件节流与线格式
+### 1. `engine/native/src/import.rs`
 
-- 进度事件最多每 `PROGRESS_MIN_BYTES = 1MB` 或每 `PROGRESS_MIN_SECS = 0.2s` 发一次（先到为准）。 dashbeam:18-22 
-- 线格式是 `<bytes>:<total>:<speed×1000>` 的字符串，发送方用 `transfer-progress`、接收方用 `receive-progress` 事件名，两端共用 `format_progress_payload`。 dashbeam:291-294 
-
-## 3. 前端解析：`parseProgressPayload`
-
-`frontend/src/lib/transfer-events.ts` 刻意**不做二次平滑**（文件头注释说明引擎已经做过窗口处理，UI 再平均只会引入延迟）：
-
-- 速度从整数除以 1000 还原，`Math.max(..., 0)` 把负值钳为 0。 dashbeam:47-49 
-- ETA 由剩余字节 ÷ 速度得出；速度为 0 或已传完时为 `undefined`，UI 就不显示 ETA。 dashbeam:50-53 
-
-## 4. UI 更新节奏
-
-`useSender` 把事件存进 `latestProgressRef`，再用 50ms 的 `setInterval` 以节流方式把最新值写入 React state —— 事件可能很频繁，但渲染被限制在 20fps。 dashbeam:277-300 dashbeam:321-326 
-
-## 5. 展示：`formatSpeed`
-
-`frontend/src/components/common/TransferProgressBar.tsx` 的 `formatSpeed`：≥1 MB/s 显示 `x.xx MB/s`，否则 `x.xx KB/s`（均为二进位制 1024）。移动端渲染在环形进度条中心，桌面端渲染在分段进度条下方的 "Speed: ..." 行。 dashbeam:9-17 dashbeam:196-204 
-
-传输完成后的成功页另有自己的 `formatSpeed`/`calculateAverageSpeed`，显示的是**全程平均速度**（文件大小 ÷ 耗时），与传输中的瞬时窗口速度不同；停止的传输显示 `NA`。 dashbeam:25-36 dashbeam:148-158 
-
-## 整体数据流
-
-```mermaid
-flowchart LR
-    Engine["引擎 SpeedMeter<br/>(3s 滑动窗口)"] -->|"bytes:total:speed×1000 字符串<br/>≥1MB 或 ≥0.2s 才发"| Parse["parseProgressPayload<br/>(还原速度、算 ETA)"]
-    Parse --> Ref["latestProgressRef"]
-    Ref -->|"50ms interval 节流"| State["setTransferProgress (React state)"]
-    State --> UI["TransferProgressBar<br/>formatSpeed → MB/s / KB/s"]
-```
-
-一个未完全验证的点：`SpeedMeter` 在 `send.rs`/`receive.rs` 中的具体调用位置（何时 `record`、何处 emit）我只确认了存在调用，没有读到具体行号；如需看引擎侧采样时机，可查看这两个文件中 `SpeedMeter` 相关代码。
-### Citations
-**File:** engine/protocol/src/progress.rs (L8-31)
 ```rust
-/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
-/// 1 the collection metadata. Every share is a collection, single files included.
-pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
-
-/// A window shorter than this is send-buffer noise rather than a transfer rate.
-const MIN_WINDOW_SECS: f64 = 0.1;
-
-/// Speed is averaged over this many seconds on both sides.
-pub const SPEED_WINDOW_SECS: f64 = 3.0;
-
-/// Progress is emitted at most once per this many bytes ...
-pub const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
-
-/// ... or once per this many seconds, whichever comes first.
-pub const PROGRESS_MIN_SECS: f64 = 0.2;
-
-/// Payload byte counts derived from a hash-seq `sizes` vector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PayloadSizes {
-    /// Hash-seq root + collection metadata: transferred, but not user payload.
-    pub overhead_bytes: u64,
-    /// Sum of the actual file sizes.
-    pub payload_bytes: u64,
-}
-```
-**File:** engine/protocol/src/progress.rs (L44-57)
-```rust
-/// Sliding-window speed estimate fed with cumulative byte counts — a cumulative
-/// average never recovers from a slow start nor drops on a stall.
-pub struct SpeedMeter {
-    window_secs: f64,
-    samples: VecDeque<(f64, u64)>,
+pub struct ShareItem {
+    /// 磁盘上的真实路径（可能是 x.iso.pdf）
+    pub path: PathBuf,
+    /// 可选：覆盖根条目名（否则用 path.file_name()）
+    pub display_name: Option<String>,
+    /// 可选：递归剥离的扩展名（如 ".pdf"），对文件本身和目录内所有文件生效
+    pub strip_suffix: Option<String>,
 }
 
-impl SpeedMeter {
-    pub fn new(window_secs: f64) -> Self {
-        Self {
-            window_secs,
-            samples: VecDeque::new(),
-        }
-    }
-```
-**File:** engine/protocol/src/progress.rs (L59-71)
-```rust
-    pub fn record(&mut self, at_secs: f64, cumulative_bytes: u64) {
-        self.samples.push_back((at_secs, cumulative_bytes));
-        let cutoff = at_secs - self.window_secs;
-        while self.samples.len() > 1 {
-            let Some(&(front_secs, _)) = self.samples.front() else {
-                break;
-            };
-            if front_secs >= cutoff {
-                break;
-            }
-            self.samples.pop_front();
-        }
-    }
-```
-**File:** engine/protocol/src/progress.rs (L75-87)
-```rust
-    pub fn bytes_per_sec_at(&self, now_secs: f64) -> f64 {
-        let (Some(&(oldest_secs, oldest_bytes)), Some(&(newest_secs, newest_bytes))) =
-            (self.samples.front(), self.samples.back())
-        else {
-            return 0.0;
-        };
-
-        let elapsed = now_secs.max(newest_secs) - oldest_secs;
-        if elapsed < MIN_WINDOW_SECS {
-            return 0.0;
-        }
-        newest_bytes.saturating_sub(oldest_bytes) as f64 / elapsed
-    }
-```
-**File:** engine/protocol/src/progress.rs (L291-294)
-```rust
-/// Wire format shared by `transfer-progress` and `receive-progress`.
-pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
-    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
-}
-```
-**File:** frontend/src/lib/transfer-events.ts (L47-49)
-```typescript
-	const speedBps = Math.max(speedInt / 1000, 0)
-	const percentage =
-		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
-```
-**File:** frontend/src/lib/transfer-events.ts (L50-53)
-```typescript
-	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
-	const etaSeconds =
-		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
-
-```
-**File:** frontend/src/hooks/useSender.ts (L277-300)
-```typescript
-					progressUpdateIntervalRef.current = setInterval(() => {
-						const currentViewState = useSenderStore.getState().viewState
-						if (latestProgressRef.current && currentViewState === 'SHARING') {
-							setTransferProgress(latestProgressRef.current)
-						}
-					}, 50)
-				} else {
-					setViewState('TRANSPORTING')
-					setTransferProgress(null)
-					setTransferMetadata(null)
-					wasManuallyStoppedRef.current = false
-
-					if (progressUpdateIntervalRef.current) {
-						clearInterval(progressUpdateIntervalRef.current)
-					}
-					progressUpdateIntervalRef.current = setInterval(() => {
-						const currentViewState = useSenderStore.getState().viewState
-						if (
-							latestProgressRef.current &&
-							currentViewState === 'TRANSPORTING'
-						) {
-							setTransferProgress(latestProgressRef.current)
-						}
-					}, 50)
-```
-**File:** frontend/src/hooks/useSender.ts (L321-326)
-```typescript
-						// The engine already windows the speed and derives the ETA
-						// from it; averaging again here only adds lag.
-						const progress = parseProgressPayload(event.payload as string)
-						if (progress) {
-							latestProgressRef.current = progress
-						}
-```
-**File:** frontend/src/components/common/TransferProgressBar.tsx (L9-17)
-```typescript
-export function formatSpeed(speedBps: number): string {
-	const mbps = speedBps / (1024 * 1024)
-	const kbps = speedBps / 1024
-	if (mbps >= 1) {
-		return `${mbps.toFixed(2)} MB/s`
-	} else {
-		return `${kbps.toFixed(2)} KB/s`
-	}
-}
-```
-**File:** frontend/src/components/common/TransferProgressBar.tsx (L196-204)
-```typescript
-				<div className="flex items-center justify-between text-xs text-muted-foreground">
-					<span>
-						{t('common:transfer.speed')}: {formatSpeed(progress.speedBps)}
-					</span>
-					<span>
-						{(progress.bytesTransferred / (1024 * 1024)).toFixed(2)} MB /{' '}
-						{(progress.totalBytes / (1024 * 1024)).toFixed(2)} MB
-					</span>
-				</div>
-```
-**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L25-36)
-```typescript
-function formatSpeed(bytesPerSecond: number): string {
-	if (bytesPerSecond === 0) return 'NA'
-
-	const mbps = bytesPerSecond / (1024 * 1024)
-	const kbps = bytesPerSecond / 1024
-
-	if (mbps >= 1) {
-		return `${mbps.toFixed(2)} MB/s`
-	} else {
-		return `${kbps.toFixed(2)} KB/s`
-	}
-}
-```
-**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L148-158)
-```typescript
-					<div className="flex justify-between items-center">
-						<span className="text-sm font-medium mr-2">
-							{t('common:transfer.avgSpeed')}:
-						</span>
-						<span className="text-sm">
-							{wasStopped
-								? 'NA'
-								: formatSpeed(
-										calculateAverageSpeed(metadata.fileSize, metadata.duration)
-									)}
-						</span>
-```
-## Q2
-对于多个超大文件是怎么传输的，一个一个还是打包为一个文件
-### Answer
-Search for collection / multi-file transfer in protocol.Need to confirm: collection = HashSeq blob listing child blobs; files transferred as separate blobs in one stream (sequential within get request). Check send.rs import to confirm each file imported as separate blob, and README note about concatenation? iroh-blobs hash seq transfers each blob; large files may be chunked internally. Read engine/native/src/import.rs and send.rs relevant parts.Answer: not packed into one file — each file imported as separate blob (BlobFormat::Raw), bundled into a Collection + HashSeq; receiver downloads all child blobs via one get request over a single QUIC connection; export writes each back to disk. Check export.rs briefly to confirm per-file export — maybe skip, I have enough. Mention resume granularity per blob.**不打包成单文件** —— 多个文件（或文件夹）作为**一个集合（Collection）里的多个独立 blob** 传输，共享同一条连接，但每个文件保持独立寻址、独立校验。
-
-## 具体机制
-
-### 1. 发送侧：每个文件一个 blob
-
-`import_paths`（`engine/native/src/import.rs`）把每个文件单独导入 blob store（`BlobFormat::Raw`），得到一个 `(文件名, hash)` 列表；然后构造一个 `Collection`（文件名 → blob hash 的映射）并把它本身也存为 blob。 dashbeam:20-24 dashbeam:85-92 
-
-集合再挂到一条 **HashSeq**（按顺序列出所有子 blob 哈希的清单）下，ticket 里只带这一个根哈希（`BlobFormat::HashSeq`）。所以**每个分享（哪怕单文件）都是一个 collection**：blob 0 是 hash-seq root，blob 1 是集合元数据，从 index 2 开始才是真正的文件 payload。 dashbeam:216-216 dashbeam:8-10 
-
-```mermaid
-flowchart TD
-    Ticket["Ticket → HashSeq root hash"] --> HS["HashSeq (blob 0)<br/>子 blob 哈希列表"]
-    HS --> Meta["Collection metadata (blob 1)<br/>文件名→哈希映射"]
-    HS --> F1["file1 (blob 2)"]
-    HS --> F2["file2 (blob 3)"]
-    HS --> F3["file3 (blob 4)"]
-```
-
-### 2. 传输方式：一条连接、一个 get 请求，按序拉取全部子 blob
-
-接收侧（`engine/protocol/src/receive.rs`）先下载 hash-seq 和 `sizes` 向量算出总 payload，然后用 `db.remote().execute_get(connection, local.missing())` 发起**一次** get 请求，流式按序取回所有缺失的子 blob —— 所有文件复用同一条 QUIC 连接（QUIC 多路复用、共享拥塞控制），而不是每个文件建一条连接。 dashbeam:155-177 
-
-因此从进度角度看它是"一个传输"：进度条的总字节是所有文件之和，速度跨文件连续统计；但落盘时每个 blob 按集合里的文件名还原成独立文件，绝不是接收方拿到一个拼起来的大文件。
-
-### 3. 这么做的收益
-
-- **粒度级断点续传**：`local.missing()` 只请求缺失的 blob/分块。传了 3 个大文件断掉后重连，已完成的文件直接跳过（`local.is_complete()` 时甚至不连），只补缺口。 dashbeam:134-135 dashbeam:224-231 
-- **独立校验**：每个 blob 由自己的 BLAKE3 哈希寻址，逐块校验，单文件损坏不会污染其他文件。
-- **广播**：`completed_peers` 计数表明同一个 collection 可同时服务多个接收者，每个 peer 只拉自己缺的部分。 dashbeam:167-170 
-
-### 与"打包"的对比
-
-唯一接近"打包"的是集合元数据本身（文件名列表），它只是几十字节的描述符。对超大文件，iroh-blobs 内部还会把单个大 blob 按 chunk 切分校验/续传，但逻辑上仍是**逐文件传输**，不是 tar 式合并。
-### Citations
-**File:** engine/native/src/import.rs (L20-24)
-```rust
 pub async fn import_paths(
-    paths: Vec<PathBuf>,
+    items: Vec<ShareItem>,
+    db: &Store,
+) -> anyhow::Result<(TempTag, u64, Collection)> {
+    // ... 原逻辑不变，把 `for path in paths` 换成:
+    for item in items {
+        let stem = item.display_name.clone().unwrap_or_else(|| {
+            stripped_name(
+                &item.path.file_name()
+                    .and_then(|s| s.to_str()).unwrap_or("item").to_string(),
+                item.strip_suffix.as_deref())
+        });
+        let import = collect_path_files(&item.path, &stem, item.strip_suffix.as_deref())?;
+        // ... 其余照旧
+    }
+}
+
+fn stripped_name(name: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s) if name.to_lowercase().ends_with(&s.to_lowercase()) && name.len() > s.len() =>
+            name[..name.len() - s.len()].to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn collect_path_files(path: &Path, root_name: &str, strip: Option<&str>)
+    -> anyhow::Result<Vec<(String, PathBuf)>>
+{
+    if path.is_file() {
+        let rel = canonicalized_path_to_string(PathBuf::from(root_name), true)?;
+        return Ok(vec![(rel, path.to_path_buf())]);
+    }
+    if path.is_dir() {
+        // 遍历照旧；对每个文件，先对 rel 的每个组件、再对文件名剥离 strip 后缀：
+        //   disk: docs/x.iso.pdf  ->  display: <root_name>/x.iso
+        let mut out = Vec::new();
+        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+            let file = entry.path().to_path_buf();
+            let rel = file.strip_prefix(path)?;
+            let mut display_rel = PathBuf::new();
+            let comps: Vec<_> = rel.components().collect();
+            for (i, c) in comps.iter().enumerate() {
+                if let Component::Normal(s) = c {
+                    let s = s.to_str().unwrap_or_default();
+                    // 只对最后一个组件（文件名）剥后缀；目录名通常没改，按需也剥
+                    let s = if i == comps.len() - 1 { stripped_name(s, strip) } else { s.to_string() };
+                    display_rel.push(s);
+                }
+            }
+            let mut prefixed = PathBuf::from(root_name);
+            prefixed.push(display_rel);
+            out.push((canonicalized_path_to_string(prefixed, true)?, file));
+        }
+        return Ok(out);
+    }
+    anyhow::bail!("path is neither file nor directory")
+}
+```
+
+注意：**磁盘读取路径（`AddPathOptions.path` / `entry.path()`）始终是真实路径 `x.iso.pdf`，只有 collection 里的名字是 `x.iso`** —— 这正好满足透明加密"读磁盘用 .pdf 触发解密、对端看到原名"的需求。
+
+### 2. `engine/native/src/send.rs`
+
+`start_share_items` 加参数（或新增 `start_share_items_named` 保持兼容）：
+
+```rust
+pub async fn start_share_items_named(
+    items: Vec<ShareItem>,
+    options: SendOptions,
+    app_handle: &AppHandle,
+    metadata: Option<FileMetadata>,
+) -> anyhow::Result<SendResult> {
+    // canonicalize 仍对每个 item.path 做；import_paths(items, ...) 替换原来的调用
+}
+```
+
+`canonicalize_input_paths` 只对 `item.path` 做 canonicalize，`display_name` 不参与磁盘路径解析（也因此天然没有目录穿越风险——它只进 collection 名字符串，`canonicalized_path_to_string` 已拒绝 `/`、`\`、`..`）。
+
+### 3. FFI 层 `engine/ffi/src/lib.rs`
+
+在 `FfiSendOptions` 里加：
+
+```rust
+/// 与 paths 平行的显示名数组；null/短数组 = 用磁盘文件名
+display_names: Vec<Option<String>>,
+/// 对每个条目剥离的扩展名（如 ".pdf"）
+strip_suffix: Option<String>,
+```
+
+`dashbeam_send_start` 里把 `path_list` 和 `display_names` zip 成 `Vec<ShareItem>`。
+
+### 4. CLI
+
+```bat
+dashbeam-send.exe --strip-suffix .pdf file.iso.pdf dir_with_pdfs\
+```
+
+CLI 侧把 `{"strip_suffix":".pdf"}` 塞进 options JSON 即可；如果是主程序主动重命名且不想要后缀剥离语义，也可以用 `display_names` 精确指定每个根条目名。
+
+## 注意事项
+
+- **目录内文件的剥离**：方案 1 中 `strip_suffix` 对目录递归生效，符合你"递归重命名所有普通文件"的场景；如果加密环境会给目录里的文件加 `.pdf` 但目录名不加，上面的实现正好只对最后一个组件剥离。
+- **碰撞**：`x.iso.pdf` 和 `x.iso` 同时存在且都剥成 `x.iso` 时，`dedup_name` 会生成 `x.iso (2)`，不会覆盖。
+- 我没能确认 `run_share_session`/`export` 端是否还有第二处用磁盘路径命名的地方——从 `import.rs` 看 collection 条目名是唯一来源，但建议落地后用一个 `x.iso.pdf` 实测一遍接收端文件名。
+## Q9
+请给出start_share_items 加参数以及相应调用(包含测试代码）的具体改动
+### Answer
+Need concrete diffs. Read send.rs, lib.rs, and current tests to write exact changes. Batch reads.Need call sites to update: commands.rs, tests/test_multi_item.rs, test_metadata.rs, test_share_peer_count.rs. Read them.Need commands.rs call site and engine/src/lib.rs + wasm call sites. Batch.Give concrete code changes: `ShareItem` struct, updated `import_paths`, `start_share_items` new signature, all call sites (send.rs deprecated wrapper, commands.rs line 273, tests), FFI wiring, plus new test. Write it out.以下是完整的改动方案。设计：新增 `ShareItem` 结构（`path` + 可选 `display_name` + 可选 `strip_suffix`），`import_paths`/`start_share_items` 改收 `Vec<ShareItem>`，旧调用点统一迁移。接收端的文件名完全由 collection 条目名决定，所以改导入层即可。
+
+## 1. `engine/native/src/import.rs`
+
+在文件顶部、`import_paths` 之前新增 `ShareItem`，并改写 `import_paths`/`collect_path_files`：
+
+```rust
+/// One item to share: the on-disk path plus an optional display name.
+///
+/// Use this when the bytes must be read under a different name than the
+/// receiver should see (e.g. transparent-encryption wrappers that append
+/// ".pdf" on disk). `path` is what gets opened; `display_name`/`strip_suffix`
+/// only shape the collection entry names the receiver downloads as.
+#[derive(Debug, Clone)]
+pub struct ShareItem {
+    /// Real path on disk (may be renamed, e.g. `x.iso.pdf`).
+    pub path: PathBuf,
+    /// Optional root entry name override. Falls back to `path.file_name()`
+    /// (with `strip_suffix` applied).
+    pub display_name: Option<String>,
+    /// Optional suffix to strip from file names, e.g. ".pdf". Applies to the
+    /// root file name and, for directories, recursively to every file inside.
+    pub strip_suffix: Option<String>,
+}
+
+impl ShareItem {
+    /// Plain item: display name == on-disk file name, no stripping.
+    pub fn plain(path: PathBuf) -> Self {
+        Self { path, display_name: None, strip_suffix: None }
+    }
+
+    /// Resolve the collection root name for this item.
+    fn root_name(&self) -> String {
+        if let Some(name) = &self.display_name {
+            return name.clone();
+        }
+        let raw = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "item".to_string());
+        strip_name_suffix(&raw, self.strip_suffix.as_deref())
+    }
+}
+
+/// Strip `suffix` from `name` (case-insensitive), unless that would empty it.
+fn strip_name_suffix(name: &str, suffix: Option<&str>) -> String {
+    match suffix {
+        Some(s)
+            if !s.is_empty()
+                && name.len() > s.len()
+                && name.to_lowercase().ends_with(&s.to_lowercase()) =>
+        {
+            name[..name.len() - s.len()].to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+```
+
+`import_paths` 签名改为 `Vec<ShareItem>`，循环体改为：
+
+```rust
+/// Import one or more filesystem paths into the blob store.
+pub async fn import_paths(
+    items: Vec<ShareItem>,
     db: &Store,
 ) -> anyhow::Result<(TempTag, u64, Collection)> {
     let mut entries: Vec<(String, TempTag, u64)> = Vec::new();
-```
-**File:** engine/native/src/import.rs (L85-92)
-```rust
-    let (collection, tags) = entries
-        .into_iter()
-        .map(|(name, tag, _)| ((name, tag.hash()), tag))
-        .unzip::<_, _, Collection, Vec<_>>();
+    let mut name_seen: BTreeMap<String, usize> = BTreeMap::new();
 
-    let temp_tag = collection.clone().store(db).await?;
-    drop(tags);
-    Ok((temp_tag, total_size, collection))
+    for item in items {
+        let stem = item.root_name();
+        let import = collect_path_files(&item.path, &stem, item.strip_suffix.as_deref())?;
+        // ...其余逻辑原样（stream 导入、dedup、entries.push）不变
+    }
+    // ...原样
+}
 ```
-**File:** engine/protocol/src/send.rs (L167-170)
-```rust
-    /// Peers that pulled the entire payload. A broadcast share serves many,
-    /// and the count is the only way a history row can describe the session
-    /// rather than just its first peer.
-    pub completed_peers: Arc<AtomicUsize>,
-```
-**File:** engine/protocol/src/send.rs (L216-216)
-```rust
-    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq);
-```
-**File:** engine/protocol/src/progress.rs (L8-10)
-```rust
-/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
-/// 1 the collection metadata. Every share is a collection, single files included.
-pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
-```
-**File:** engine/protocol/src/receive.rs (L134-135)
-```rust
-    let (stats, total_files, payload_size, download_duration_ms) = if !local.is_complete() {
-        emit_event(app_handle, "receive-started");
-```
-**File:** engine/protocol/src/receive.rs (L155-177)
-```rust
-        let sizes_result =
-            get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
-                .await;
 
-        let (hash_seq, sizes) = match sizes_result {
-            Ok((hash_seq, sizes)) => (hash_seq, sizes),
-            Err(e) => {
-                tracing::error!("Failed to get sizes: {:?}", e);
-                tracing::error!("Error type: {}", std::any::type_name_of_val(&e));
-                return Err(show_get_error(e).into());
+`collect_path_files` 加 `strip` 参数，目录分支只对**最后一个组件（文件名）**剥离：
+
+```rust
+fn collect_path_files(
+    path: &Path,
+    root_name: &str,
+    strip: Option<&str>,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    if path.is_file() {
+        let rel = canonicalized_path_to_string(PathBuf::from(root_name), true)?;
+        return Ok(vec![(rel, path.to_path_buf())]);
+    }
+
+    if path.is_dir() {
+        let mut out = Vec::new();
+        for (index, entry) in WalkDir::new(path).into_iter().enumerate() {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_e) => {
+                    tracing::warn!("skipping inaccessible entry {}", index);
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
             }
-        };
-        // `sizes` holds children only (entry 0 is the collection metadata), but
-        // the get stream counts the hash-seq root and that blob too — subtract
-        // them to leave the same "file bytes" the sender reports.
-        let root_bytes = (hash_seq.len() as u64).saturating_mul(32);
-        let split = split_child_sizes(root_bytes, &sizes);
-        let payload_size = split.payload_bytes;
-        let total_files = (sizes.len().saturating_sub(1)) as u64;
+            let file = entry.path().to_path_buf();
+            let rel = file
+                .strip_prefix(path)
+                .with_context(|| format!("strip_prefix failed for file {}", index))?;
 
-        emit_progress_event(app_handle, 0, payload_size, 0.0);
+            // Rebuild the relative path, stripping the suffix from the file name.
+            let comps: Vec<_> = rel.components().collect();
+            let mut display_rel = PathBuf::new();
+            for (i, c) in comps.iter().enumerate() {
+                if let Component::Normal(s) = c {
+                    let s = s.to_str().unwrap_or_default();
+                    let s = if i == comps.len() - 1 {
+                        strip_name_suffix(s, strip)
+                    } else {
+                        s.to_string()
+                    };
+                    display_rel.push(s);
+                }
+            }
 
-        let get = db.remote().execute_get(connection, local.missing());
+            let mut prefixed = PathBuf::from(root_name);
+            prefixed.push(&display_rel);
+            let safe = canonicalized_path_to_string(prefixed, true)?;
+            out.push((safe, file));
+        }
+        return Ok(out);
+    }
+    anyhow::bail!("path is neither file nor directory");
+}
 ```
-**File:** engine/protocol/src/receive.rs (L224-231)
+
+`canonicalize_input_paths` 改为收 items 并只 canonicalize 磁盘路径：
+
 ```rust
+pub fn canonicalize_input_paths(items: Vec<ShareItem>) -> anyhow::Result<Vec<ShareItem>> {
+    use std::collections::BTreeSet;
+    let mut uniq_paths = BTreeSet::new();
+    let mut out: Vec<ShareItem> = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let c = item
+            .path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize path {}", index))?;
+        ensure!(c.exists(), "path {} does not exist", index);
+        if uniq_paths.insert(c.clone()) {
+            out.push(ShareItem { path: c, ..item });
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "no valid paths provided");
+    Ok(out)
+}
+```
+
+注意：去重仍按磁盘路径做。两个不同磁盘路径剥离后同名时，`dedup_name` 会生成 `x.iso (2)`，不会覆盖。
+
+## 2. `engine/native/src/send.rs`
+
+```rust
+use crate::import::{canonicalize_input_paths, ShareItem};
+
+/// Deprecated: prefer [`start_share_items`].
+pub async fn start_share(
+    path: PathBuf,
+    options: SendOptions,
+    app_handle: AppHandle,
+    metadata: Option<FileMetadata>,
+) -> anyhow::Result<SendResult> {
+    start_share_items(vec![ShareItem::plain(path)], options, &app_handle, metadata).await
+}
+
+/// Starts sharing the provided items (files or directories).
+///
+/// Each `ShareItem` may carry a `display_name`/`strip_suffix` that renames the
+/// collection entries the receiver sees — the bytes are always read from
+/// `item.path`, so on-disk renames (e.g. an encryption wrapper appending
+/// ".pdf") are invisible to the peer.
+pub async fn start_share_items(
+    items: Vec<ShareItem>,
+    options: SendOptions,
+    app_handle: &AppHandle,
+    metadata: Option<FileMetadata>,
+) -> anyhow::Result<SendResult> {
+    // ...
+    ensure!(!items.is_empty(), "no paths provided for sharing");
+    // ...端点构建部分原样
+    let canonical_items = canonicalize_input_paths(items)?;
+    // entry_type 判定改用 canonical_items[0].path.is_dir()：
+    let is_collection = canonical_items.len() > 1;
+    let entry_type_for_progress = if is_collection {
+        "collection".to_string()
+    } else if canonical_items[0].path.is_dir() {
+        "directory".to_string()
     } else {
-        let total_files = local.children().unwrap() - 1;
-        let payload_bytes = 0;
-
-        emit_event(app_handle, "receive-started");
-        emit_event(app_handle, "receive-completed");
-
-        (Stats::default(), total_files, payload_bytes, 0)
+        "file".to_string()
+    };
+    // ...
+    let (temp_tag, size, _collection) =
+        crate::import::import_paths(canonical_items, blobs.store()).await?;
+    // ...run_share_session 调用原样
+}
 ```
-## Q3
-发送端能够展示每个文件的传输进度吗
-### Answer
-Check if sender tracks per-file progress. Search for per-file progress events.Check send.rs progress emission — does sender know which blob is being sent? Grep for SpeedMeter/progress in send.rs.Read send.rs around progress emission to see if per-blob info is available.Check ShareProgress (ledger) — blob_started/blob_progress record per-blob index. Does it know file boundaries? Check progress.rs ShareProgress briefly.Answer: No per-file progress currently. Sender tracks per-blob index internally via ledger.blob_started(key, m.index, m.size) and blob_progress(key, m.end_offset), but emits only aggregate bytes:total:speed. Could be extended since m.index maps to files via collection ordering.**目前不能** —— 发送端只在内部按 blob 记账，对外只发**聚合进度**，前端没有逐文件进度可显示。
 
-## 现状
+## 3. `engine/native/src/lib.rs`
 
-### 引擎内部其实知道每个 blob（文件）的进度
-
-`send.rs` 的 `SessionProgress.ledger`（`ShareProgress`）按 `(connection_id, request_id)` + blob index 记账：
-
-- `RequestUpdate::Started` 时调用 `session.ledger.blob_started(key, m.index, m.size)` —— 拿到了**当前在传哪个 blob（`m.index`）及其大小**。 dashbeam:439-457 
-- `RequestUpdate::Progress` 时调用 `session.ledger.blob_progress(key, m.end_offset)` —— 拿到该 blob 的字节偏移。 dashbeam:458-483 
-
-由于 collection 里 blob index 与文件一一对应（index ≥ 2 为 payload 文件，顺序即 collection 中的文件顺序），引擎**具备推导"正在传第几个文件、该文件传了多少"所需的全部信息**。 dashbeam:8-10 
-
-### 但发出的事件只有聚合值
-
-`emit_session_progress` 把 ledger snapshot 聚合成 `bytes:total:speed` 三字段发出，payload 里**不含 blob index 或文件名**。 dashbeam:334-342 dashbeam:291-294 
-
-前端 `transfer-progress` 事件的 schema 也只有 `bytesTransferred / totalBytes / speedBps / etaSeconds`，UI 只能显示总进度条。 dashbeam:47-53 
-
-## 如果要支持逐文件进度
-
-改动是可行的，因为数据都在：
-
-1. `emit_session_progress` 在发事件时从 ledger 取出当前活跃 blob 的 `index` 和 `end_offset`，把 `index → 文件名` 映射（发送侧有 collection）连同该文件已传字节一起塞进 payload；
-2. `parseProgressPayload` 扩展字段解析；
-3. UI 增加当前文件名 + 文件序号（"第 3/7 个文件"）或逐文件进度条。
-
-注意两点复杂性：blob 的请求顺序不一定严格串行（接收端按 `missing()` 范围拉取，多个请求可交错），以及广播场景下多个 peer 同时拉不同文件时"当前文件"不唯一——展示上需要选定某个 peer 或取聚合口径。这两点我未在代码中验证现有处理，属于设计时需要确认的地方。
-### Citations
-**File:** engine/protocol/src/send.rs (L334-342)
 ```rust
-fn emit_session_progress(app_handle: &AppHandle, session: &SessionProgress, at_secs: f64) {
-    let snapshot = session.ledger.snapshot();
-    emit_progress_event(
-        app_handle,
-        snapshot.bytes,
-        snapshot.total,
-        session.speed.bytes_per_sec_at(at_secs),
+pub use import::ShareItem;
+pub use send::{start_share, start_share_items};
+```
+
+## 4. 调用点迁移
+
+`src-tauri/src/commands.rs:273`（`send_items` 内）：
+
+```rust
+use engine::ShareItem;
+// ...
+let items: Vec<ShareItem> = path_bufs.iter().cloned().map(ShareItem::plain).collect();
+let result = start_share_items(items, options, &boxed_handle, Some(metadata))
+    .await
+    .map_err(|error| { /* 原样 */ })?;
+```
+
+现有测试全部改为 `.map(ShareItem::plain)`：
+
+```rust
+// engine/tests/test_multi_item.rs:14 与 :67
+let share = start_share_items(
+    vec![file_a, file_b, file_c].into_iter().map(ShareItem::plain).collect(),
+    SendOptions::default(), &None, None,
+).await...
+```
+
+`test_metadata.rs:60`、`test_share_peer_count.rs:14` 同理。
+
+## 5. FFI 层接线（`engine/ffi/src/lib.rs`）
+
+`FfiSendOptions` 加两个字段，`dashbeam_send_start` 里构造 items：
+
+```rust
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FfiSendOptions {
+    // ...原有字段
+    /// 与 paths 平行的显示名；null/短数组表示该项用磁盘名。
+    display_names: Vec<Option<String>>,
+    /// 对所有条目的文件名递归剥离的后缀，如 ".pdf"。
+    strip_suffix: Option<String>,
+}
+
+// dashbeam_send_start 内部：
+let strip = ffi_opts.strip_suffix.clone();
+let mut items = Vec::with_capacity(path_list.len());
+for (i, p) in path_list.into_iter().enumerate() {
+    items.push(ShareItem {
+        path: p,
+        display_name: ffi_opts.display_names.get(i).cloned().flatten(),
+        strip_suffix: strip.clone(),
+    });
+}
+// spawn 里: start_share_items(items, options, &app_handle, metadata)
+```
+
+CLI 侧 `dashbeam-send.exe --strip-suffix .pdf file.iso.pdf` 只需把 `{"strip_suffix":".pdf"}` 传进 `options_json`。
+
+## 6. 新测试 `engine/tests/test_display_name.rs`
+
+验证磁盘名与接收端显示名分离：
+
+```rust
+mod common;
+
+use common::TestFixture;
+use engine::{download, start_share_items, ReceiveOptions, SendOptions, ShareItem};
+use std::path::PathBuf;
+
+/// Disk name carries the ".pdf" wrapper (transparent-encryption scenario),
+/// receiver must see the original name.
+#[tokio::test]
+async fn e2e_strip_suffix_renames_received_file() {
+    let fixture = TestFixture::new();
+    let content = b"iso bytes";
+    // On disk: payload.iso.pdf — receiver should get payload.iso
+    let file = fixture.create_file("payload.iso.pdf", content);
+    let recv_dir = fixture.output_dir();
+
+    let share = start_share_items(
+        vec![ShareItem { path: file, display_name: None, strip_suffix: Some(".pdf".into()) }],
+        SendOptions::default(),
+        &None,
+        None,
+    )
+    .await
+    .expect("start_share_items should succeed");
+
+    let (_cancel_tx, cancel_rx) = common::no_cancel();
+    download(
+        share.ticket.clone(),
+        ReceiveOptions { output_dir: Some(recv_dir.clone()), ..Default::default() },
+        None,
+        cancel_rx,
+    )
+    .await
+    .expect("download should succeed");
+
+    assert_eq!(std::fs::read(recv_dir.join("payload.iso")).unwrap(), content);
+    assert!(!recv_dir.join("payload.iso.pdf").exists());
+    drop(share);
+}
+
+/// Directory: suffix is stripped recursively from every file inside.
+#[tokio::test]
+async fn e2e_strip_suffix_renames_files_in_dir() {
+    let fixture = TestFixture::new();
+    let dir = fixture.create_dir_with_files(
+        "folder",
+        &[("a.iso.pdf", b"AAA"), ("sub/b.iso.pdf", b"BBB"), ("plain.txt", b"CCC")],
     );
+    let recv_dir = fixture.output_dir();
+
+    let share = start_share_items(
+        vec![ShareItem { path: dir, display_name: None, strip_suffix: Some(".pdf".into()) }],
+        SendOptions::default(),
+        &None,
+        None,
+    )
+    .await
+    .expect("start_share_items should succeed");
+
+    let (_cancel_tx, cancel_rx) = common::no_cancel();
+    download(
+        share.ticket.clone(),
+        ReceiveOptions { output_dir: Some(recv_dir.clone()), ..Default::default() },
+        None,
+        cancel_rx,
+    )
+    .await
+    .expect("download should succeed");
+
+    assert_eq!(std::fs::read(recv_dir.join("folder/a.iso")).unwrap(), b"AAA");
+    assert_eq!(std::fs::read(recv_dir.join("folder/sub/b.iso")).unwrap(), b"BBB");
+    // 不带后缀的文件不受影响
+    assert_eq!(std::fs::read(recv_dir.join("folder/plain.txt")).unwrap(), b"CCC");
+    drop(share);
+}
+
+/// display_name overrides the root entry name entirely.
+#[tokio::test]
+async fn e2e_display_name_overrides_root() {
+    let fixture = TestFixture::new();
+    let file = fixture.create_file("real.iso.pdf", b"data");
+    let recv_dir = fixture.output_dir();
+
+    let share = start_share_items(
+        vec![ShareItem {
+            path: file,
+            display_name: Some("nice-name.iso".into()),
+            strip_suffix: None,
+        }],
+        SendOptions::default(),
+        &None,
+        None,
+    )
+    .await
+    .expect("start_share_items should succeed");
+
+    let (_cancel_tx, cancel_rx) = common::no_cancel();
+    download(
+        share.ticket.clone(),
+        ReceiveOptions { output_dir: Some(recv_dir.clone()), ..Default::default() },
+        None,
+        cancel_rx,
+    )
+    .await
+    .expect("download should succeed");
+
+    assert_eq!(std::fs::read(recv_dir.join("nice-name.iso")).unwrap(), b"data");
+    drop(share);
+}
+
+/// PathBuf -> ShareItem ergonomic conversion keeps plain callers terse.
+#[test]
+fn share_item_plain_preserves_name() {
+    let item = ShareItem::plain(PathBuf::from("x.iso.pdf"));
+    assert_eq!(item.root_name(), "x.iso.pdf");
 }
 ```
-**File:** engine/protocol/src/send.rs (L439-457)
+
+`import.rs` 内部再补一个单元测试覆盖 `strip_name_suffix` 边界：
+
 ```rust
-                                    iroh_blobs::provider::events::RequestUpdate::Started(m) => {
-                                        let active_count = {
-                                            let mut session = session_task.lock().await;
-                                            let at_secs = session.now_secs();
-                                            session.clock.mark_start(at_secs);
-                                            session.ledger.blob_started(key, m.index, m.size);
-                                            session.ledger.active_requests()
-                                        };
-
-                                        if !transfer_started {
-                                            emit_active_connection_count(&app_handle_task, active_count);
-
-                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
-                                                emit_event(&app_handle_task, "transfer-started");
-                                            }
-
-                                            transfer_started = true;
-                                        }
-                                    }
-```
-**File:** engine/protocol/src/send.rs (L458-483)
-```rust
-                                    iroh_blobs::provider::events::RequestUpdate::Progress(m) => {
-                                        if !transfer_started {
-                                            let active_count = {
-                                                let mut session = session_task.lock().await;
-                                                let at_secs = session.now_secs();
-                                                session.clock.mark_start(at_secs);
-                                                session.ledger.ensure_request(key);
-                                                session.ledger.active_requests()
-                                            };
-
-                                            emit_active_connection_count(&app_handle_task, active_count);
-
-                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
-                                                emit_event(&app_handle_task, "transfer-started");
-                                            }
-                                            transfer_started = true;
-                                        }
-
-                                        let mut session = session_task.lock().await;
-                                        session.ledger.blob_progress(key, m.end_offset);
-                                        let at_secs = session.now_secs();
-                                        let bytes = session.ledger.snapshot().bytes;
-                                        if session.record(at_secs, bytes) {
-                                            emit_session_progress(&app_handle_task, &session, at_secs);
-                                        }
-                                    }
-```
-**File:** engine/protocol/src/progress.rs (L8-10)
-```rust
-/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
-/// 1 the collection metadata. Every share is a collection, single files included.
-pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
-```
-**File:** engine/protocol/src/progress.rs (L291-294)
-```rust
-/// Wire format shared by `transfer-progress` and `receive-progress`.
-pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
-    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
+#[test]
+fn strip_suffix_edge_cases() {
+    assert_eq!(strip_name_suffix("x.iso.pdf", Some(".pdf")), "x.iso");
+    assert_eq!(strip_name_suffix("x.PDF", Some(".pdf")), "x");          // 大小写不敏感
+    assert_eq!(strip_name_suffix("x.pdf", Some(".pdf")), "x.pdf");      // 剥完为空则保留
+    assert_eq!(strip_name_suffix("x.iso", Some(".pdf")), "x.iso");      // 不匹配不剥
+    assert_eq!(strip_name_suffix("x.iso.pdf", None), "x.iso.pdf");
 }
 ```
-**File:** frontend/src/lib/transfer-events.ts (L47-53)
-```typescript
-	const speedBps = Math.max(speedInt / 1000, 0)
-	const percentage =
-		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
-	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
-	const etaSeconds =
-		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
 
+## 注意
+
+- `engine/tests/common` 里的 `TestFixture.create_file`/`create_dir_with_files`/`output_dir`/`no_cancel` 沿用了现有测试的辅助函数（见 `test_multi_item.rs` 用法），新测试文件直接复用。
+- 签名变更会影响所有 `start_share_items` 调用方；除上述列出的文件外，`wasm-io`/`wasm-bridge` 有同名函数但属于另一套实现，不受影响。
+- `display_name` 只进 collection 字符串，`canonicalized_path_to_string` 会拒绝 `/`、`\`、`..`，天然防目录穿越——接收端导出路径由 collection 名决定，这点要保持。
+## Q10
+给出FFI 层接口（engine/ffi/src/lib.rs）具体修改
+### Answer
+Provide concrete FFI lib.rs changes incorporating ShareItem/display_names/strip_suffix, based on prior established code. Maybe quickly verify current lib.rs doesn't exist yet (it was proposed). Just give full updated lib.rs. No need for tools really, but check whether engine/ffi exists now? Quick grep for ShareItem to see if landed.The `engine/ffi` crate doesn't exist yet — it's all proposal. So I give the complete final `engine/ffi/src/lib.rs` including the display_names/strip_suffix wiring. Also update header signature? User asked specifically lib.rs changes. Provide full file with the diff parts highlighted.`engine/ffi` 目前还不存在（都是前面讨论的设计稿），所以直接给出完整版 `engine/ffi/src/lib.rs`，其中相对上一版的变化点已标注 `// NEW` —— 核心是 `FfiSendOptions` 增加 `display_names`/`strip_suffix`，并把 `path_list` 组装成 `Vec<ShareItem>` 传给 `start_share_items`。
+
+## `engine/ffi/src/lib.rs`（完整版）
+
+```rust
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::net::{SocketAddrV4, SocketAddrV6};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use native::{start_share_items, SendResult, ShareItem};          // NEW: ShareItem
+use protocol::{
+    AddrInfoOptions, AppHandle, DiscoveryModeOption, EventEmitter, FileMetadata,
+    RelayModeOption, SendOptions,
+};
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("dashbeam tokio runtime")
+    })
+}
+
+/// Live share sessions keyed by handle. Dropping a SendResult shuts the router
+/// down and auto-cleans the blobs dir, so removal == cancel.
+fn sessions() -> &'static Mutex<HashMap<i64, SendResult>> {
+    static S: OnceLock<Mutex<HashMap<i64, SendResult>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn last_error_slot() -> &'static Mutex<Option<CString>> {
+    static E: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(None))
+}
+
+fn set_last_error(msg: &str) {
+    if let Ok(mut slot) = last_error_slot().lock() {
+        *slot = CString::new(msg).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Options (JSON) -> protocol::SendOptions + Vec<ShareItem>
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FfiSendOptions {
+    /// "default" | "disabled" | "custom"
+    relay_mode: String,
+    /// relay_mode = "custom" 时的 relay URL 列表
+    relay_urls: Vec<String>,
+    relay_auth_token: Option<String>,
+    /// "default" | "custom"
+    discovery_mode: String,
+    pkarr_relay_url: Option<String>,
+    dns_origin: Option<String>,
+    /// "Id" | "RelayAndAddresses" | "Relay" | "Addresses"
+    ticket_type: String,
+    /// e.g. "0.0.0.0:0"
+    ipv4_addr: Option<String>,
+    ipv6_addr: Option<String>,
+    /// 可选文件元数据（透传 protocol::FileMetadata 的 serde 形状）
+    metadata: Option<FileMetadata>,
+
+    // ---- NEW: 透明显示名（透明加密场景）----------------------------------
+    /// 与 paths 平行的显示名数组：display_names[i] 是 paths[i] 在接收端
+    /// 看到的根条目名。数组可短于 paths，缺失/null 项用磁盘文件名。
+    /// 例: paths=["/d/x.iso.pdf"], display_names=["x.iso"]
+    display_names: Vec<Option<String>>,
+    /// 对所有条目的文件名剥离的后缀（大小写不敏感），如 ".pdf"。
+    /// 对文件条目剥根名；对目录条目递归剥其中每个文件的名字。
+    /// 与 display_names 同时存在时，display_names 优先（直接覆盖根名）。
+    strip_suffix: Option<String>,
+}
+
+fn map_options(o: &FfiSendOptions) -> anyhow::Result<SendOptions> {
+    let relay_mode = match o.relay_mode.as_str() {
+        "" | "default" => RelayModeOption::Default,
+        "disabled" => RelayModeOption::Disabled,
+        "custom" => {
+            let urls = o
+                .relay_urls
+                .iter()
+                .map(|s| {
+                    iroh::RelayUrl::from_str(s)
+                        .map_err(|e| anyhow::anyhow!("bad relay url {s}: {e}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            RelayModeOption::Custom { urls, auth_token: o.relay_auth_token.clone() }
+        }
+        other => anyhow::bail!("unknown relay_mode: {other}"),
+    };
+
+    let discovery_mode = match o.discovery_mode.as_str() {
+        "" | "default" => DiscoveryModeOption::Default,
+        "custom" => {
+            let url = o
+                .pkarr_relay_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("custom discovery requires pkarr_relay_url"))
+                .and_then(|s| {
+                    url::Url::parse(s).map_err(|e| anyhow::anyhow!("bad pkarr url: {e}"))
+                })?;
+            DiscoveryModeOption::Custom {
+                pkarr_relay_url: url,
+                dns_origin: o.dns_origin.clone(),
+            }
+        }
+        other => anyhow::bail!("unknown discovery_mode: {other}"),
+    };
+
+    let ticket_type = if o.ticket_type.is_empty() {
+        AddrInfoOptions::Id
+    } else {
+        AddrInfoOptions::from_str(&o.ticket_type)
+            .map_err(|e| anyhow::anyhow!("bad ticket_type: {e}"))?
+    };
+
+    let magic_ipv4_addr = o
+        .ipv4_addr
+        .as_deref()
+        .map(SocketAddrV4::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("bad ipv4_addr: {e}"))?;
+    let magic_ipv6_addr = o
+        .ipv6_addr
+        .as_deref()
+        .map(SocketAddrV6::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("bad ipv6_addr: {e}"))?;
+
+    Ok(SendOptions {
+        relay_mode,
+        discovery_mode,
+        ticket_type,
+        magic_ipv4_addr,
+        magic_ipv6_addr,
+    })
+}
+
+/// NEW: 把 FFI 路径数组 + 显示名/剥后缀选项组装成 Vec<ShareItem>。
+fn build_items(path_list: Vec<PathBuf>, o: &FfiSendOptions) -> Vec<ShareItem> {
+    path_list
+        .into_iter()
+        .enumerate()
+        .map(|(i, path)| ShareItem {
+            path,
+            display_name: o.display_names.get(i).cloned().flatten(),
+            strip_suffix: o.strip_suffix.clone(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// EventEmitter -> C callback
+// ---------------------------------------------------------------------------
+
+/// event/payload 字符串仅在回调执行期间有效，C++ 侧需要复制。
+pub type DashbeamEventCb = extern "C" fn(*const c_char, *const c_char, *mut c_void);
+
+struct CbEmitter {
+    cb: DashbeamEventCb,
+    user_data: usize, // 原始指针按值传递
+}
+
+unsafe impl Send for CbEmitter {}
+unsafe impl Sync for CbEmitter {}
+
+impl CbEmitter {
+    fn fire(&self, name: &str, payload: Option<&str>) -> Result<(), String> {
+        let name = CString::new(name).map_err(|e| e.to_string())?;
+        let payload = match payload {
+            Some(p) => CString::new(p).map_err(|e| e.to_string())?,
+            None => CString::new("").map_err(|e| e.to_string())?,
+        };
+        (self.cb)(name.as_ptr(), payload.as_ptr(), self.user_data as *mut c_void);
+        Ok(())
+    }
+}
+
+impl EventEmitter for CbEmitter {
+    fn emit_event(&self, event_name: &str) -> Result<(), String> {
+        self.fire(event_name, None)
+    }
+    fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
+        self.fire(event_name, Some(payload))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI
+// ---------------------------------------------------------------------------
+
+/// 启动分享。立即返回句柄（>0）；分享就绪后以 "share-ready" 事件回调
+/// {"handle","ticket","hash","size","entry_type"}，失败回调 "share-error"。
+/// options_json 可为 NULL（全默认）。返回 -1 表示参数错误，
+/// 错误文本见 dashbeam_last_error。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_start(
+    paths: *const *const c_char,
+    path_count: usize,
+    options_json: *const c_char,
+    event_cb: Option<DashbeamEventCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if paths.is_null() || path_count == 0 {
+            return Err(anyhow::anyhow!("paths is null or empty"));
+        }
+        let mut path_list = Vec::with_capacity(path_count);
+        for i in 0..path_count {
+            let p = unsafe { *paths.add(i) };
+            if p.is_null() {
+                return Err(anyhow::anyhow!("paths[{i}] is null"));
+            }
+            let s = unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("paths[{i}] not utf-8: {e}"))?;
+            path_list.push(PathBuf::from(s));
+        }
+
+        // 解析 options（NULL 视为 "{}"），拆成 SendOptions / items / metadata
+        let ffi_opts: FfiSendOptions = if options_json.is_null() {
+            FfiSendOptions::default()
+        } else {
+            let json = unsafe { CStr::from_ptr(options_json) }
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("options not utf-8: {e}"))?;
+            serde_json::from_str(json)
+                .map_err(|e| anyhow::anyhow!("bad options json: {e}"))?
+        };
+        let options = map_options(&ffi_opts)?;
+        let metadata = ffi_opts.metadata.clone();
+        let items = build_items(path_list, &ffi_opts);            // NEW
+
+        let handle_id = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
+
+        let app_handle: AppHandle = event_cb.map(|cb| {
+            Arc::new(CbEmitter { cb, user_data: user_data as usize })
+                as Arc<dyn EventEmitter>
+        });
+
+        let cb = event_cb;
+        let ud = user_data as usize;
+
+        runtime().spawn(async move {
+            let emit = |name: &str, payload: &str| {
+                if let Some(cb) = cb {
+                    if let (Ok(n), Ok(p)) = (CString::new(name), CString::new(payload)) {
+                        cb(n.as_ptr(), p.as_ptr(), ud as *mut c_void);
+                    }
+                }
+            };
+
+            match start_share_items(items, options, &app_handle, metadata).await {
+                Ok(result) => {
+                    let ready = serde_json::json!({
+                        "handle": handle_id,
+                        "ticket": result.ticket,
+                        "hash": result.hash,
+                        "size": result.size,
+                        "entry_type": result.entry_type,
+                    });
+                    emit("share-ready", &ready.to_string());
+                    sessions()
+                        .lock()
+                        .expect("sessions poisoned")
+                        .insert(handle_id, result);
+                }
+                Err(e) => {
+                    emit("share-error", &format!("{e:#}"));
+                }
+            }
+        });
+
+        Ok(handle_id)
+    }));
+
+    match result {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            set_last_error(&format!("{e:#}"));
+            -1
+        }
+        Err(_) => {
+            set_last_error("panic in dashbeam_send_start");
+            -1
+        }
+    }
+}
+
+/// 取消分享并释放句柄。成功返回 0，句柄不存在返回 -1。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_stop(handle: i64) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        sessions().lock().expect("sessions poisoned").remove(&handle)
+    })) {
+        Ok(Some(_)) => 0, // drop SendResult -> router 关闭、目录清理
+        Ok(None) => {
+            set_last_error("unknown handle");
+            -1
+        }
+        Err(_) => {
+            set_last_error("panic in dashbeam_send_stop");
+            -1
+        }
+    }
+}
+
+/// 已完成完整传输的对端数（share 会话内累计）。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_completed_peers(handle: i64) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        sessions()
+            .lock()
+            .expect("sessions poisoned")
+            .get(&handle)
+            .map(|r| r.completed_peers() as i64)
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// 返回最后一次错误的字符串（内部持有，不要 free）。无错误返回 NULL。
+#[no_mangle]
+pub extern "C" fn dashbeam_last_error() -> *const c_char {
+    last_error_slot()
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|c| c.as_ptr()))
+        .unwrap_or(std::ptr::null())
+}
 ```
+
+## 配套改动
+
+**`engine/ffi/Cargo.toml`** 无需变（`ShareItem` 复用 `native` 依赖，`native` crate 需 `pub use import::ShareItem`，见上一轮 `lib.rs` 导出）。
+
+**`dashbeam.h` 注释更新**（options_json 文档补两个字段，函数签名不变）：
+
+```c
+ *   "display_names": ["x.iso", null, ...],  // 与 paths 平行，可选
+ *   "strip_suffix": ".pdf",                 // 递归剥离文件后缀，可选
+```
+
+## C++ 调用示例（透明加密场景）
+
+```cpp
+// 磁盘上是 a.iso.pdf / docs 目录（内部文件均为 *.pdf），
+// 接收端看到 a.iso 和 docs/<原名>
+const char *paths[] = {"C:\\data\\a.iso.pdf", "C:\\data\\docs"};
+const char *opts = R"({
+    "ticket_type": "RelayAndAddresses",
+    "strip_suffix": ".pdf"
+})";
+int64_t h = dashbeam_send_start(paths, 2, opts, on_event, nullptr);
+```
+
+## 注意点
+
+- `map_options` 改为收 `&FfiSendOptions`，因为 `metadata`/`display_names`/`strip_suffix` 之后还要用，不能整体 move——这就是为什么拆成了 `map_options` + `build_items` 两步。
+- `FileMetadata` 若没 derive `Clone`，`ffi_opts.metadata.clone()` 改为 `std::mem::take(&mut ffi_opts.metadata)`（把 `ffi_opts` 声明为 `mut`）。落地时按 `types.rs` 实际 derive 调整。
+- `display_names[i]` 会直接作为 collection 根条目名，native 层的 `canonicalized_path_to_string` 会拒绝含 `/`、`\`、`..` 的名字并返回错误——FFI 会把错误通过 `share-error` 事件/`dashbeam_last_error` 透出，不需要额外校验。
+- 我没能实际编译验证（`ShareItem` 需要先在 `native` 侧落地），`iroh::RelayUrl::from_str` 与 `AddrInfoOptions::from_str` 的错误类型如有出入按编译器提示微调 `map_err` 即可。
+## Q11
+dashbeam-send.exe --strip-suffix .pdf file.iso.pdf dir_with_pdfs
+同步修改cpp文件，给命令行添加参数
+### Answer
+Update the CLI cpp to parse --strip-suffix arg and build options JSON. Provide full updated dashbeam-send.cpp.更新 `cli/dashbeam-send.cpp`，新增 `--strip-suffix <后缀>` 参数（可多次省略，默认不剥离），把值塞进 `options_json`。其余逻辑不变。
+
+## `cli/dashbeam-send.cpp`（完整版）
+
+```cpp
+// dashbeam-send: 通过 dashbeam_ffi.dll 分享文件/文件夹的命令行工具
+// 用法: dashbeam-send [--strip-suffix <后缀>] <文件或目录> [更多路径...]
+//
+// --strip-suffix .pdf: 接收端看到的文件名会剥掉 ".pdf" 后缀（大小写不敏感），
+//   磁盘上仍以原名读取 —— 用于透明加密环境（磁盘名 x.iso.pdf -> 对端 x.iso）。
+//   对目录条目递归生效。
+//
+// 默认使用公共 iroh relay/discovery + RelayAndAddresses ticket。
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
+#include "dashbeam.h"
+
+namespace fs = std::filesystem;
+
+static std::atomic<bool> g_ready{false};
+static std::atomic<bool> g_failed{false};
+static std::atomic<bool> g_quit{false};
+static int g_connected_peers = 0;
+
+static void on_event(const char *event, const char *payload, void *user_data) {
+    (void)user_data;
+    const char *p = payload ? payload : "";
+
+    if (std::strcmp(event, "share-ready") == 0) {
+        // payload: {"handle","ticket","hash","size","entry_type"}
+        std::string json(p);
+        auto pos = json.find("\"ticket\":\"");
+        if (pos != std::string::npos) {
+            pos += 10;
+            auto end = json.find('"', pos);
+            std::string ticket = json.substr(pos, end - pos);
+            std::printf("\n=== 分享已就绪 ===\n");
+            std::printf("ticket: %s\n", ticket.c_str());
+            std::printf("(完整回执: %s)\n\n", p);
+            std::printf("等待接收端连接... Ctrl+C 停止分享\n");
+        } else {
+            std::printf("[share-ready] %s\n", p);
+        }
+        g_ready = true;
+    } else if (std::strcmp(event, "share-error") == 0) {
+        std::fprintf(stderr, "[share-error] %s\n", p);
+        g_failed = true;
+    } else if (std::strcmp(event, "share-peer-connected") == 0) {
+        ++g_connected_peers;
+        std::printf("[peer] 新对端连接 (累计 %d): %s\n", g_connected_peers, p);
+    } else if (std::strcmp(event, "transfer-started") == 0) {
+        std::printf("[transfer] 开始传输\n");
+    } else if (std::strcmp(event, "transfer-progress") == 0) {
+        // payload: "bytes:total:speed*1000"
+        uint64_t bytes = 0, total = 0, speedx1000 = 0;
+        if (std::sscanf(p, "%llu:%llu:%llu",
+                        (unsigned long long *)&bytes,
+                        (unsigned long long *)&total,
+                        (unsigned long long *)&speedx1000) == 3) {
+            double pct = total ? 100.0 * bytes / total : 0.0;
+            std::printf("\r[transfer] %llu/%llu bytes (%.1f%%)  %.2f MB/s   ",
+                        (unsigned long long)bytes, (unsigned long long)total,
+                        pct, speedx1000 / 1000.0);
+            std::fflush(stdout);
+        }
+    } else if (std::strcmp(event, "transfer-completed") == 0) {
+        std::printf("\n[transfer] 完成: %s\n", p);
+    } else if (std::strcmp(event, "transfer-failed") == 0) {
+        std::printf("\n[transfer] 失败: %s\n", p);
+    }
+    // "active-connection-count" 太吵，不打印
+}
+
+#ifdef _WIN32
+static BOOL WINAPI console_ctrl(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
+        g_quit = true;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void sigint_handler(int) { g_quit = true; }
+#endif
+
+// ---- 参数解析 --------------------------------------------------------------
+
+struct CliArgs {
+    std::string strip_suffix;          // 为空 = 不剥离
+    std::vector<std::string> paths;    // 位置参数：文件/目录
+};
+
+static void usage(const char *prog) {
+    std::fprintf(stderr,
+        "用法: %s [--strip-suffix <后缀>] <文件或目录> [更多路径...]\n"
+        "\n"
+        "选项:\n"
+        "  --strip-suffix <后缀>   接收端文件名剥离该后缀（如 .pdf），磁盘名不变\n"
+        "  -h, --help              显示本帮助\n",
+        prog);
+}
+
+// 返回 false = 解析失败或请求 help（已打印 usage）
+static bool parse_args(int argc, char **argv, CliArgs &out, bool &help) {
+    help = false;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+            help = true;
+            return false;
+        }
+        if (std::strcmp(a, "--strip-suffix") == 0) {
+            if (++i >= argc) {
+                std::fprintf(stderr, "--strip-suffix 缺少参数\n");
+                return false;
+            }
+            out.strip_suffix = argv[i];
+            // 允许 "pdf" 或 ".pdf" 两种写法，统一补点
+            if (!out.strip_suffix.empty() && out.strip_suffix[0] != '.')
+                out.strip_suffix = "." + out.strip_suffix;
+            continue;
+        }
+        if (std::strncmp(a, "--strip-suffix=", 15) == 0) {
+            out.strip_suffix = a + 15;
+            if (!out.strip_suffix.empty() && out.strip_suffix[0] != '.')
+                out.strip_suffix = "." + out.strip_suffix;
+            continue;
+        }
+        if (a[0] == '-' && a[1] != '\0') {
+            std::fprintf(stderr, "未知选项: %s\n", a);
+            return false;
+        }
+        out.paths.push_back(a);
+    }
+    return true;
+}
+
+// 最小 JSON 字符串转义（后缀里出现引号/反斜杠才需要）
+static std::string json_escape(const std::string &s) {
+    std::string r;
+    for (char c : s) {
+        switch (c) {
+            case '"':  r += "\\\""; break;
+            case '\\': r += "\\\\"; break;
+            default:   r += c;
+        }
+    }
+    return r;
+}
+
+// ---- main ------------------------------------------------------------------
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCtrlHandler(console_ctrl, TRUE);
+#else
+    std::signal(SIGINT, sigint_handler);
+#endif
+
+    CliArgs args;
+    bool help = false;
+    if (!parse_args(argc, argv, args, help) || args.paths.empty()) {
+        if (!help)
+            std::fprintf(stderr, "%s\n",
+                         help ? "" : "错误: 参数无效或没有提供任何路径\n");
+        usage(argv[0]);
+        return 2;
+    }
+
+    // 1. 校验并收集路径（文件或目录均可）
+    std::vector<std::string> storage;
+    std::vector<const char *> paths;
+    for (const auto &a : args.paths) {
+        std::error_code ec;
+        fs::path p = fs::absolute(a, ec);
+        if (ec || !fs::exists(p, ec)) {
+            std::fprintf(stderr, "路径不存在: %s\n", a.c_str());
+            return 2;
+        }
+        storage.push_back(p.string());
+        paths.push_back(storage.back().c_str());
+        std::printf("添加: %s\n", storage.back().c_str());
+    }
+
+    // 2. 构造 options JSON：RelayAndAddresses ticket（避免 Id ticket 的
+    //    DNS 解析时序问题）+ 可选 strip_suffix
+    std::string opts = R"({"ticket_type":"RelayAndAddresses")";
+    if (!args.strip_suffix.empty()) {
+        opts += ",\"strip_suffix\":\"" + json_escape(args.strip_suffix) + "\"";
+        std::printf("strip-suffix: %s（接收端文件名将剥掉该后缀）\n",
+                    args.strip_suffix.c_str());
+    }
+    opts += "}";
+
+    // 3. 启动分享
+    int64_t h = dashbeam_send_start(paths.data(), paths.size(),
+                                    opts.c_str(), on_event, nullptr);
+    if (h < 0) {
+        const char *err = dashbeam_last_error();
+        std::fprintf(stderr, "启动分享失败: %s\n", err ? err : "unknown");
+        return 1;
+    }
+    std::printf("正在上线（公共 iroh relay）...\n");
+
+    // 4. 等待 share-ready / share-error
+    for (int i = 0; i < 600 && !g_ready && !g_failed && !g_quit; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (g_failed) { dashbeam_send_stop(h); return 1; }
+    if (!g_ready) {
+        std::fprintf(stderr, "%s\n", g_quit ? "已取消" : "等待 share-ready 超时");
+        dashbeam_send_stop(h);
+        return 1;
+    }
+
+    // 5. 保持分享会话存活，直到 Ctrl+C
+    while (!g_quit)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    std::printf("\n正在停止分享...\n");
+    if (dashbeam_send_stop(h) != 0) {
+        const char *err = dashbeam_last_error();
+        std::fprintf(stderr, "停止失败: %s\n", err ? err : "unknown");
+        return 1;
+    }
+    std::printf("已停止。\n");
+    return 0;
+}
+```
+
+## 使用
+
+```bat
+:: 普通分享（不改名）
+dashbeam-send.exe photo.jpg docs\
+
+:: 透明加密：磁盘名带 .pdf，接收端看到原名
+dashbeam-send.exe --strip-suffix .pdf file.iso.pdf dir_with_pdfs\
+
+:: 后缀可省略点，效果相同
+dashbeam-send.exe --strip-suffix=pdf file.iso.pdf
+```
+
+## 说明
+
+- 参数解析支持 `--strip-suffix .pdf`、`--strip-suffix=.pdf`、`--strip-suffix pdf` 三种写法，内部统一补 `.`。
+- `strip_suffix` 直接编进 `options_json` 传给 `dashbeam_send_start` —— 依赖上一轮的 FFI 改动（`FfiSendOptions.strip_suffix` → `ShareItem.strip_suffix` → `import.rs` 的剥离逻辑）。
+- 目录参数 `dir_with_pdfs\` 不需要任何额外处理：native 层的 `strip_suffix` 对目录内每个文件的相对路径名递归生效（只剥最后一个组件），磁盘读取路径不变。
+- 手工拼 JSON 只对 `strip_suffix` 做了最小转义；如果以后 options 字段变多，建议换 nlohmann/json。
+- 编译命令不变：`cl /std:c++17 /EHsc /utf-8 /O2 /I engine\ffi\include cli\dashbeam-send.cpp target\release\dashbeam_ffi.lib /Fe:dashbeam-send.exe`。
+## Q12
+怎么用命令运行上述修改测试文件
+### Answer
+How to run the test files? Cargo tests: `cargo test --manifest-path engine/Cargo.toml -p sendme-native --test test_display_name`. Check package name for engine crate? engine/Cargo.toml root is probably package sendme-engine; tests in engine/tests belong to that package. Provide commands.测试文件在 `engine/tests/` 下，属于 workspace 根 crate（`engine/Cargo.toml` 的 package 是 `sendme-engine`），用 cargo test 即可：
+
+## 运行所有测试
+
+```bash
+cd engine
+cargo test                      # 整个 sendme-engine 包：lib 单元测试 + tests/ 下所有集成测试
+```
+
+或从仓库根目录：
+
+```bash
+cargo test --manifest-path engine/Cargo.toml
+```
+
+## 只跑新增的 `test_display_name.rs`
+
+```bash
+cargo test --manifest-path engine/Cargo.toml --test test_display_name
+```
+
+按测试名过滤（例如只跑目录递归剥离那个）：
+
+```bash
+cargo test --manifest-path engine/Cargo.toml --test test_display_name e2e_strip_suffix_renames_files_in_dir
+```
+
+## 只跑 `import.rs` 里的单元测试（`strip_name_suffix` 边界）
+
+```bash
+cargo test --manifest-path engine/Cargo.toml strip_suffix_edge_cases
+```
+
+## 看输出详情 / 失败排查
+
+```bash
+# 显示 println!/tracing 输出（默认被吞掉）
+cargo test --manifest-path engine/Cargo.toml --test test_display_name -- --nocapture
+
+# 串行跑（测试有真实网络/DNS 操作，并行偶发干扰时可以这样）
+cargo test --manifest-path engine/Cargo.toml --test test_display_name -- --test-threads=1
+```
+
+## 注意事项
+
+- 这些 e2e 测试会真实建 iroh endpoint、走公共 relay 连接，**需要联网**，且首次握手可能要几秒。
+- 如果机器网络不通 relay，可以参考现有测试的做法（`test_metadata.rs`/`test_share_peer_count.rs` 里用了 `opts()`，如果它包含 relay 固定地址或本地 relay 覆盖，测试环境内网也能跑——先看 `common/mod.rs` 里 `opts()` 的定义）。
+- `strip_suffix_edge_cases` 是纯单元测试，不联网，放在 `import.rs` 的 `#[cfg(test)]` 模块里跑。
+- 编译报错大概率在：`ShareItem` 未从 `native::lib.rs` 导出、或 `common::TestFixture` 的辅助函数名与我写的不一致——以 `engine/tests/common/mod.rs` 的实际签名为准微调即可。

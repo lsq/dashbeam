@@ -48,6 +48,8 @@ typedef void (*dashbeam_event_cb)(const char *event,
  *   "ipv4_addr": "0.0.0.0:0",
  *   "ipv6_addr": "[::]:0",
  *   "metadata": {"file_name":"...","item_count":1,"size":123,...}
+ *   "display_names": ["x.iso", null, ...],  // 与 paths 平行，可选
+ *   "strip_suffix": ".pdf",                 // 递归剥离文件后缀，可选
  * }
  *
  * 返回 >0 的句柄；返回 -1 时调用 dashbeam_last_error() 取错误。
@@ -60,6 +62,13 @@ DASHBEAM_API int64_t dashbeam_send_start(const char *const *paths,
 
 /* 停止并释放分享会话。返回 0 成功，-1 句柄无效。 */
 DASHBEAM_API int32_t dashbeam_send_stop(int64_t handle);
+
+/* 停止并释放分享会话。
+ * out_completed_peers 可传 NULL；非 NULL 时会写入停止前（与关闭过程原子）
+ * 读取到的已完成对端数，句柄无效时写 -1。
+ * 返回 0 成功，-1 句柄无效。
+ */
+// DASHBEAM_API int32_t dashbeam_send_stop(int64_t handle, int64_t *out_completed_peers);
 
 /* 已完成传输的对端数；句柄无效返回 -1。 */
 DASHBEAM_API int64_t dashbeam_send_completed_peers(int64_t handle);

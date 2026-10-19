@@ -11,23 +11,27 @@ use iroh_blobs::{
 };
 use tokio::sync::mpsc;
 
-use crate::import::canonicalize_input_paths;
+use crate::import::{canonicalize_input_paths, ShareItem};
 use crate::storage;
 use crate::types::{AutoCleanupDir, SendResult};
 
-/// Deprecated: prefer [`start_share_items`].
 pub async fn start_share(
     path: PathBuf,
     options: SendOptions,
     app_handle: AppHandle,
     metadata: Option<FileMetadata>,
 ) -> anyhow::Result<SendResult> {
-    start_share_items(vec![path], options, &app_handle, metadata).await
+    start_share_items(vec![ShareItem::plain(path)], options, &app_handle, metadata).await
 }
 
 /// Starts sharing the provided paths (files or directories).
+///
+/// Each `ShareItem` may carry a `display_name`/`strip_suffix` that renames the  
+/// collection entries the receiver sees — the bytes are always read from  
+/// `item.path`, so on-disk renames (e.g. an encryption wrapper appending  
+/// ".pdf") are invisible to the peer.
 pub async fn start_share_items(
-    paths: Vec<PathBuf>,
+    items: Vec<ShareItem>,
     options: SendOptions,
     app_handle: &AppHandle,
     metadata: Option<FileMetadata>,
@@ -35,7 +39,7 @@ pub async fn start_share_items(
     use protocol::{get_or_create_secret, AddrInfoOptions};
     use anyhow::ensure;
 
-    ensure!(!paths.is_empty(), "no paths provided for sharing");
+    ensure!(!items.is_empty(), "no paths provided for sharing");
 
     // Ephemeral endpoint: must not reuse the node's persistent identity while
     // the control endpoint is online, or the relay rejects duplicate endpoint ids.
@@ -72,14 +76,14 @@ pub async fn start_share_items(
     }
 
     let blobs_data_dir = storage::new_send_blobs_dir();
-    let canonical_paths = canonicalize_input_paths(paths)?;
+    let canonical_items = canonicalize_input_paths(items)?;
     let blobs_data_dir2 = blobs_data_dir.clone();
     let (progress_tx, progress_rx) = mpsc::channel(64);
     let app_handle_clone = app_handle.clone();
-    let is_collection = canonical_paths.len() > 1;
+    let is_collection = canonical_items.len() > 1;
     let entry_type_for_progress = if is_collection {
         "collection".to_string()
-    } else if canonical_paths[0].is_dir() {
+    } else if canonical_items[0].path.is_dir() {
         "directory".to_string()
     } else {
         "file".to_string()
@@ -103,7 +107,7 @@ pub async fn start_share_items(
         );
 
         let (temp_tag, size, _collection) =
-            crate::import::import_paths(canonical_paths, blobs.store()).await?;
+            crate::import::import_paths(canonical_items, blobs.store()).await?;
 
         run_share_session(
             endpoint,

@@ -3,7 +3,8 @@ name: E2E Tests
 on:
   push:
     branches:
-      - main
+      # - main
+      - c_ffi
   pull_request:
     branches:
       - main

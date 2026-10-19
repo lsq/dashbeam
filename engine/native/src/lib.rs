@@ -32,5 +32,6 @@ pub use history::{
 pub use nearby::{NearbyDevice, NearbyRegistry, ObserveOutcome};
 pub use node::NodeService;
 pub use receive::download;
+pub use import::ShareItem;
 pub use send::{start_share, start_share_items};
 pub use types::{ReceiveResult, SendResult};

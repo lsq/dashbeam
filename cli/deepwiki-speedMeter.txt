@@ -1,0 +1,720 @@
+[SpeedMeter](https://deepwiki.com/search/_fa2cd547-e1e7-44fe-b0c9-cb5398a03939?mode=deep)
+
+# DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam
+## Q1
+传输界面速度展示逻辑
+### Answer
+User asks in Chinese: "传输界面速度展示逻辑" — the logic for displaying transfer speed in the transfer UI. Search repo dashbeam.I have enough. Maybe quickly check how engine emits speed events — the SpeedMeter usage. Enough context to answer. Could check where record/emit happens, but can summarize. Let me quickly check the receiver side too? Keep it concise. Maybe grep for SpeedMeter usage.Look at send.rs usage briefly.Read relevant lines of send.rs and receive.rs around speed emission quickly — grep with context isn't available; use read_file? grep_search doesn't give line numbers. I have one iteration left. Read send.rs partially — but file may be large. Try reading targeted via read_file on progress.rs header (to get MIN_WINDOW_SECS, window size) plus send.rs matches location. Just read progress.rs fully (already saw most) and send.rs first ~120 lines? Better: read progress.rs lines 1-33 for constants, and send.rs around progress emit — can't know lines. Use read_file with send.rs first 200 lines and receive.rs similarly — two reads in parallel.Produce answer in Chinese explaining the speed display logic: engine-side sliding-window SpeedMeter, wire format, frontend parsing, UI rendering. Cite files/lines.传输速度展示由**引擎统一计算、前端只做渲染**的分层设计实现。核心原则是两端（发送方/接收方）用同一套算法算速度，前端不重新平滑或估算。
+
+## 1. 引擎侧：`SpeedMeter` 滑动窗口测速
+
+`engine/protocol/src/progress.rs` 定义了共享的进度统计逻辑：
+
+- `SpeedMeter` 是一个**滑动窗口**测速器（默认窗口 `SPEED_WINDOW_SECS = 3.0` 秒），维护 `(时间, 累计字节数)` 样本队列。累计平均值会被慢启动拖垮、也不会在停顿时回落，所以改用窗口。 dashbeam:44-57 
+- `record()` 每次写入时清理超出窗口的旧样本。 dashbeam:59-71 
+- `bytes_per_sec_at(now_secs)` 用窗口首尾样本差值除以耗时计算速率；`now_secs` 会延伸到"当下"，所以传输卡顿时速度会自然衰减到 0。窗口耗时小于 `MIN_WINDOW_SECS = 0.1` 秒时返回 0，避免把发送缓冲区的瞬时突发当成真实速率。 dashbeam:75-87 dashbeam:12-22 
+
+- 速度只统计**用户 payload 字节**：`split_child_sizes` 把 hash-seq root 和集合元数据从计数字节中剔除（`FIRST_PAYLOAD_BLOB_INDEX = 2`），保证显示的速度反映实际文件传输而非协议开销。 dashbeam:8-31 
+
+## 2. 事件节流与线格式
+
+- 进度事件最多每 `PROGRESS_MIN_BYTES = 1MB` 或每 `PROGRESS_MIN_SECS = 0.2s` 发一次（先到为准）。 dashbeam:18-22 
+- 线格式是 `<bytes>:<total>:<speed×1000>` 的字符串，发送方用 `transfer-progress`、接收方用 `receive-progress` 事件名，两端共用 `format_progress_payload`。 dashbeam:291-294 
+
+## 3. 前端解析：`parseProgressPayload`
+
+`frontend/src/lib/transfer-events.ts` 刻意**不做二次平滑**（文件头注释说明引擎已经做过窗口处理，UI 再平均只会引入延迟）：
+
+- 速度从整数除以 1000 还原，`Math.max(..., 0)` 把负值钳为 0。 dashbeam:47-49 
+- ETA 由剩余字节 ÷ 速度得出；速度为 0 或已传完时为 `undefined`，UI 就不显示 ETA。 dashbeam:50-53 
+
+## 4. UI 更新节奏
+
+`useSender` 把事件存进 `latestProgressRef`，再用 50ms 的 `setInterval` 以节流方式把最新值写入 React state —— 事件可能很频繁，但渲染被限制在 20fps。 dashbeam:277-300 dashbeam:321-326 
+
+## 5. 展示：`formatSpeed`
+
+`frontend/src/components/common/TransferProgressBar.tsx` 的 `formatSpeed`：≥1 MB/s 显示 `x.xx MB/s`，否则 `x.xx KB/s`（均为二进位制 1024）。移动端渲染在环形进度条中心，桌面端渲染在分段进度条下方的 "Speed: ..." 行。 dashbeam:9-17 dashbeam:196-204 
+
+传输完成后的成功页另有自己的 `formatSpeed`/`calculateAverageSpeed`，显示的是**全程平均速度**（文件大小 ÷ 耗时），与传输中的瞬时窗口速度不同；停止的传输显示 `NA`。 dashbeam:25-36 dashbeam:148-158 
+
+## 整体数据流
+
+```mermaid
+flowchart LR
+    Engine["引擎 SpeedMeter<br/>(3s 滑动窗口)"] -->|"bytes:total:speed×1000 字符串<br/>≥1MB 或 ≥0.2s 才发"| Parse["parseProgressPayload<br/>(还原速度、算 ETA)"]
+    Parse --> Ref["latestProgressRef"]
+    Ref -->|"50ms interval 节流"| State["setTransferProgress (React state)"]
+    State --> UI["TransferProgressBar<br/>formatSpeed → MB/s / KB/s"]
+```
+
+一个未完全验证的点：`SpeedMeter` 在 `send.rs`/`receive.rs` 中的具体调用位置（何时 `record`、何处 emit）我只确认了存在调用，没有读到具体行号；如需看引擎侧采样时机，可查看这两个文件中 `SpeedMeter` 相关代码。
+### Citations
+**File:** engine/protocol/src/progress.rs (L8-31)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+
+/// A window shorter than this is send-buffer noise rather than a transfer rate.
+const MIN_WINDOW_SECS: f64 = 0.1;
+
+/// Speed is averaged over this many seconds on both sides.
+pub const SPEED_WINDOW_SECS: f64 = 3.0;
+
+/// Progress is emitted at most once per this many bytes ...
+pub const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+
+/// ... or once per this many seconds, whichever comes first.
+pub const PROGRESS_MIN_SECS: f64 = 0.2;
+
+/// Payload byte counts derived from a hash-seq `sizes` vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadSizes {
+    /// Hash-seq root + collection metadata: transferred, but not user payload.
+    pub overhead_bytes: u64,
+    /// Sum of the actual file sizes.
+    pub payload_bytes: u64,
+}
+```
+**File:** engine/protocol/src/progress.rs (L44-57)
+```rust
+/// Sliding-window speed estimate fed with cumulative byte counts — a cumulative
+/// average never recovers from a slow start nor drops on a stall.
+pub struct SpeedMeter {
+    window_secs: f64,
+    samples: VecDeque<(f64, u64)>,
+}
+
+impl SpeedMeter {
+    pub fn new(window_secs: f64) -> Self {
+        Self {
+            window_secs,
+            samples: VecDeque::new(),
+        }
+    }
+```
+**File:** engine/protocol/src/progress.rs (L59-71)
+```rust
+    pub fn record(&mut self, at_secs: f64, cumulative_bytes: u64) {
+        self.samples.push_back((at_secs, cumulative_bytes));
+        let cutoff = at_secs - self.window_secs;
+        while self.samples.len() > 1 {
+            let Some(&(front_secs, _)) = self.samples.front() else {
+                break;
+            };
+            if front_secs >= cutoff {
+                break;
+            }
+            self.samples.pop_front();
+        }
+    }
+```
+**File:** engine/protocol/src/progress.rs (L75-87)
+```rust
+    pub fn bytes_per_sec_at(&self, now_secs: f64) -> f64 {
+        let (Some(&(oldest_secs, oldest_bytes)), Some(&(newest_secs, newest_bytes))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
+
+        let elapsed = now_secs.max(newest_secs) - oldest_secs;
+        if elapsed < MIN_WINDOW_SECS {
+            return 0.0;
+        }
+        newest_bytes.saturating_sub(oldest_bytes) as f64 / elapsed
+    }
+```
+**File:** engine/protocol/src/progress.rs (L291-294)
+```rust
+/// Wire format shared by `transfer-progress` and `receive-progress`.
+pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
+    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
+}
+```
+**File:** frontend/src/lib/transfer-events.ts (L47-49)
+```typescript
+	const speedBps = Math.max(speedInt / 1000, 0)
+	const percentage =
+		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
+```
+**File:** frontend/src/lib/transfer-events.ts (L50-53)
+```typescript
+	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
+	const etaSeconds =
+		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
+
+```
+**File:** frontend/src/hooks/useSender.ts (L277-300)
+```typescript
+					progressUpdateIntervalRef.current = setInterval(() => {
+						const currentViewState = useSenderStore.getState().viewState
+						if (latestProgressRef.current && currentViewState === 'SHARING') {
+							setTransferProgress(latestProgressRef.current)
+						}
+					}, 50)
+				} else {
+					setViewState('TRANSPORTING')
+					setTransferProgress(null)
+					setTransferMetadata(null)
+					wasManuallyStoppedRef.current = false
+
+					if (progressUpdateIntervalRef.current) {
+						clearInterval(progressUpdateIntervalRef.current)
+					}
+					progressUpdateIntervalRef.current = setInterval(() => {
+						const currentViewState = useSenderStore.getState().viewState
+						if (
+							latestProgressRef.current &&
+							currentViewState === 'TRANSPORTING'
+						) {
+							setTransferProgress(latestProgressRef.current)
+						}
+					}, 50)
+```
+**File:** frontend/src/hooks/useSender.ts (L321-326)
+```typescript
+						// The engine already windows the speed and derives the ETA
+						// from it; averaging again here only adds lag.
+						const progress = parseProgressPayload(event.payload as string)
+						if (progress) {
+							latestProgressRef.current = progress
+						}
+```
+**File:** frontend/src/components/common/TransferProgressBar.tsx (L9-17)
+```typescript
+export function formatSpeed(speedBps: number): string {
+	const mbps = speedBps / (1024 * 1024)
+	const kbps = speedBps / 1024
+	if (mbps >= 1) {
+		return `${mbps.toFixed(2)} MB/s`
+	} else {
+		return `${kbps.toFixed(2)} KB/s`
+	}
+}
+```
+**File:** frontend/src/components/common/TransferProgressBar.tsx (L196-204)
+```typescript
+				<div className="flex items-center justify-between text-xs text-muted-foreground">
+					<span>
+						{t('common:transfer.speed')}: {formatSpeed(progress.speedBps)}
+					</span>
+					<span>
+						{(progress.bytesTransferred / (1024 * 1024)).toFixed(2)} MB /{' '}
+						{(progress.totalBytes / (1024 * 1024)).toFixed(2)} MB
+					</span>
+				</div>
+```
+**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L25-36)
+```typescript
+function formatSpeed(bytesPerSecond: number): string {
+	if (bytesPerSecond === 0) return 'NA'
+
+	const mbps = bytesPerSecond / (1024 * 1024)
+	const kbps = bytesPerSecond / 1024
+
+	if (mbps >= 1) {
+		return `${mbps.toFixed(2)} MB/s`
+	} else {
+		return `${kbps.toFixed(2)} KB/s`
+	}
+}
+```
+**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L148-158)
+```typescript
+					<div className="flex justify-between items-center">
+						<span className="text-sm font-medium mr-2">
+							{t('common:transfer.avgSpeed')}:
+						</span>
+						<span className="text-sm">
+							{wasStopped
+								? 'NA'
+								: formatSpeed(
+										calculateAverageSpeed(metadata.fileSize, metadata.duration)
+									)}
+						</span>
+```
+## Q2
+对于多个超大文件是怎么传输的，一个一个还是打包为一个文件
+### Answer
+Search for collection / multi-file transfer in protocol.Need to confirm: collection = HashSeq blob listing child blobs; files transferred as separate blobs in one stream (sequential within get request). Check send.rs import to confirm each file imported as separate blob, and README note about concatenation? iroh-blobs hash seq transfers each blob; large files may be chunked internally. Read engine/native/src/import.rs and send.rs relevant parts.Answer: not packed into one file — each file imported as separate blob (BlobFormat::Raw), bundled into a Collection + HashSeq; receiver downloads all child blobs via one get request over a single QUIC connection; export writes each back to disk. Check export.rs briefly to confirm per-file export — maybe skip, I have enough. Mention resume granularity per blob.**不打包成单文件** —— 多个文件（或文件夹）作为**一个集合（Collection）里的多个独立 blob** 传输，共享同一条连接，但每个文件保持独立寻址、独立校验。
+
+## 具体机制
+
+### 1. 发送侧：每个文件一个 blob
+
+`import_paths`（`engine/native/src/import.rs`）把每个文件单独导入 blob store（`BlobFormat::Raw`），得到一个 `(文件名, hash)` 列表；然后构造一个 `Collection`（文件名 → blob hash 的映射）并把它本身也存为 blob。 dashbeam:20-24 dashbeam:85-92 
+
+集合再挂到一条 **HashSeq**（按顺序列出所有子 blob 哈希的清单）下，ticket 里只带这一个根哈希（`BlobFormat::HashSeq`）。所以**每个分享（哪怕单文件）都是一个 collection**：blob 0 是 hash-seq root，blob 1 是集合元数据，从 index 2 开始才是真正的文件 payload。 dashbeam:216-216 dashbeam:8-10 
+
+```mermaid
+flowchart TD
+    Ticket["Ticket → HashSeq root hash"] --> HS["HashSeq (blob 0)<br/>子 blob 哈希列表"]
+    HS --> Meta["Collection metadata (blob 1)<br/>文件名→哈希映射"]
+    HS --> F1["file1 (blob 2)"]
+    HS --> F2["file2 (blob 3)"]
+    HS --> F3["file3 (blob 4)"]
+```
+
+### 2. 传输方式：一条连接、一个 get 请求，按序拉取全部子 blob
+
+接收侧（`engine/protocol/src/receive.rs`）先下载 hash-seq 和 `sizes` 向量算出总 payload，然后用 `db.remote().execute_get(connection, local.missing())` 发起**一次** get 请求，流式按序取回所有缺失的子 blob —— 所有文件复用同一条 QUIC 连接（QUIC 多路复用、共享拥塞控制），而不是每个文件建一条连接。 dashbeam:155-177 
+
+因此从进度角度看它是"一个传输"：进度条的总字节是所有文件之和，速度跨文件连续统计；但落盘时每个 blob 按集合里的文件名还原成独立文件，绝不是接收方拿到一个拼起来的大文件。
+
+### 3. 这么做的收益
+
+- **粒度级断点续传**：`local.missing()` 只请求缺失的 blob/分块。传了 3 个大文件断掉后重连，已完成的文件直接跳过（`local.is_complete()` 时甚至不连），只补缺口。 dashbeam:134-135 dashbeam:224-231 
+- **独立校验**：每个 blob 由自己的 BLAKE3 哈希寻址，逐块校验，单文件损坏不会污染其他文件。
+- **广播**：`completed_peers` 计数表明同一个 collection 可同时服务多个接收者，每个 peer 只拉自己缺的部分。 dashbeam:167-170 
+
+### 与"打包"的对比
+
+唯一接近"打包"的是集合元数据本身（文件名列表），它只是几十字节的描述符。对超大文件，iroh-blobs 内部还会把单个大 blob 按 chunk 切分校验/续传，但逻辑上仍是**逐文件传输**，不是 tar 式合并。
+### Citations
+**File:** engine/native/src/import.rs (L20-24)
+```rust
+pub async fn import_paths(
+    paths: Vec<PathBuf>,
+    db: &Store,
+) -> anyhow::Result<(TempTag, u64, Collection)> {
+    let mut entries: Vec<(String, TempTag, u64)> = Vec::new();
+```
+**File:** engine/native/src/import.rs (L85-92)
+```rust
+    let (collection, tags) = entries
+        .into_iter()
+        .map(|(name, tag, _)| ((name, tag.hash()), tag))
+        .unzip::<_, _, Collection, Vec<_>>();
+
+    let temp_tag = collection.clone().store(db).await?;
+    drop(tags);
+    Ok((temp_tag, total_size, collection))
+```
+**File:** engine/protocol/src/send.rs (L167-170)
+```rust
+    /// Peers that pulled the entire payload. A broadcast share serves many,
+    /// and the count is the only way a history row can describe the session
+    /// rather than just its first peer.
+    pub completed_peers: Arc<AtomicUsize>,
+```
+**File:** engine/protocol/src/send.rs (L216-216)
+```rust
+    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq);
+```
+**File:** engine/protocol/src/progress.rs (L8-10)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+```
+**File:** engine/protocol/src/receive.rs (L134-135)
+```rust
+    let (stats, total_files, payload_size, download_duration_ms) = if !local.is_complete() {
+        emit_event(app_handle, "receive-started");
+```
+**File:** engine/protocol/src/receive.rs (L155-177)
+```rust
+        let sizes_result =
+            get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
+                .await;
+
+        let (hash_seq, sizes) = match sizes_result {
+            Ok((hash_seq, sizes)) => (hash_seq, sizes),
+            Err(e) => {
+                tracing::error!("Failed to get sizes: {:?}", e);
+                tracing::error!("Error type: {}", std::any::type_name_of_val(&e));
+                return Err(show_get_error(e).into());
+            }
+        };
+        // `sizes` holds children only (entry 0 is the collection metadata), but
+        // the get stream counts the hash-seq root and that blob too — subtract
+        // them to leave the same "file bytes" the sender reports.
+        let root_bytes = (hash_seq.len() as u64).saturating_mul(32);
+        let split = split_child_sizes(root_bytes, &sizes);
+        let payload_size = split.payload_bytes;
+        let total_files = (sizes.len().saturating_sub(1)) as u64;
+
+        emit_progress_event(app_handle, 0, payload_size, 0.0);
+
+        let get = db.remote().execute_get(connection, local.missing());
+```
+**File:** engine/protocol/src/receive.rs (L224-231)
+```rust
+    } else {
+        let total_files = local.children().unwrap() - 1;
+        let payload_bytes = 0;
+
+        emit_event(app_handle, "receive-started");
+        emit_event(app_handle, "receive-completed");
+
+        (Stats::default(), total_files, payload_bytes, 0)
+```
+## Q3
+发送端能够展示每个文件的传输进度吗
+### Answer
+Check if sender tracks per-file progress. Search for per-file progress events.Check send.rs progress emission — does sender know which blob is being sent? Grep for SpeedMeter/progress in send.rs.Read send.rs around progress emission to see if per-blob info is available.Check ShareProgress (ledger) — blob_started/blob_progress record per-blob index. Does it know file boundaries? Check progress.rs ShareProgress briefly.Answer: No per-file progress currently. Sender tracks per-blob index internally via ledger.blob_started(key, m.index, m.size) and blob_progress(key, m.end_offset), but emits only aggregate bytes:total:speed. Could be extended since m.index maps to files via collection ordering.**目前不能** —— 发送端只在内部按 blob 记账，对外只发**聚合进度**，前端没有逐文件进度可显示。
+
+## 现状
+
+### 引擎内部其实知道每个 blob（文件）的进度
+
+`send.rs` 的 `SessionProgress.ledger`（`ShareProgress`）按 `(connection_id, request_id)` + blob index 记账：
+
+- `RequestUpdate::Started` 时调用 `session.ledger.blob_started(key, m.index, m.size)` —— 拿到了**当前在传哪个 blob（`m.index`）及其大小**。 dashbeam:439-457 
+- `RequestUpdate::Progress` 时调用 `session.ledger.blob_progress(key, m.end_offset)` —— 拿到该 blob 的字节偏移。 dashbeam:458-483 
+
+由于 collection 里 blob index 与文件一一对应（index ≥ 2 为 payload 文件，顺序即 collection 中的文件顺序），引擎**具备推导"正在传第几个文件、该文件传了多少"所需的全部信息**。 dashbeam:8-10 
+
+### 但发出的事件只有聚合值
+
+`emit_session_progress` 把 ledger snapshot 聚合成 `bytes:total:speed` 三字段发出，payload 里**不含 blob index 或文件名**。 dashbeam:334-342 dashbeam:291-294 
+
+前端 `transfer-progress` 事件的 schema 也只有 `bytesTransferred / totalBytes / speedBps / etaSeconds`，UI 只能显示总进度条。 dashbeam:47-53 
+
+## 如果要支持逐文件进度
+
+改动是可行的，因为数据都在：
+
+1. `emit_session_progress` 在发事件时从 ledger 取出当前活跃 blob 的 `index` 和 `end_offset`，把 `index → 文件名` 映射（发送侧有 collection）连同该文件已传字节一起塞进 payload；
+2. `parseProgressPayload` 扩展字段解析；
+3. UI 增加当前文件名 + 文件序号（"第 3/7 个文件"）或逐文件进度条。
+
+注意两点复杂性：blob 的请求顺序不一定严格串行（接收端按 `missing()` 范围拉取，多个请求可交错），以及广播场景下多个 peer 同时拉不同文件时"当前文件"不唯一——展示上需要选定某个 peer 或取聚合口径。这两点我未在代码中验证现有处理，属于设计时需要确认的地方。
+### Citations
+**File:** engine/protocol/src/send.rs (L334-342)
+```rust
+fn emit_session_progress(app_handle: &AppHandle, session: &SessionProgress, at_secs: f64) {
+    let snapshot = session.ledger.snapshot();
+    emit_progress_event(
+        app_handle,
+        snapshot.bytes,
+        snapshot.total,
+        session.speed.bytes_per_sec_at(at_secs),
+    );
+}
+```
+**File:** engine/protocol/src/send.rs (L439-457)
+```rust
+                                    iroh_blobs::provider::events::RequestUpdate::Started(m) => {
+                                        let active_count = {
+                                            let mut session = session_task.lock().await;
+                                            let at_secs = session.now_secs();
+                                            session.clock.mark_start(at_secs);
+                                            session.ledger.blob_started(key, m.index, m.size);
+                                            session.ledger.active_requests()
+                                        };
+
+                                        if !transfer_started {
+                                            emit_active_connection_count(&app_handle_task, active_count);
+
+                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                                emit_event(&app_handle_task, "transfer-started");
+                                            }
+
+                                            transfer_started = true;
+                                        }
+                                    }
+```
+**File:** engine/protocol/src/send.rs (L458-483)
+```rust
+                                    iroh_blobs::provider::events::RequestUpdate::Progress(m) => {
+                                        if !transfer_started {
+                                            let active_count = {
+                                                let mut session = session_task.lock().await;
+                                                let at_secs = session.now_secs();
+                                                session.clock.mark_start(at_secs);
+                                                session.ledger.ensure_request(key);
+                                                session.ledger.active_requests()
+                                            };
+
+                                            emit_active_connection_count(&app_handle_task, active_count);
+
+                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                                emit_event(&app_handle_task, "transfer-started");
+                                            }
+                                            transfer_started = true;
+                                        }
+
+                                        let mut session = session_task.lock().await;
+                                        session.ledger.blob_progress(key, m.end_offset);
+                                        let at_secs = session.now_secs();
+                                        let bytes = session.ledger.snapshot().bytes;
+                                        if session.record(at_secs, bytes) {
+                                            emit_session_progress(&app_handle_task, &session, at_secs);
+                                        }
+                                    }
+```
+**File:** engine/protocol/src/progress.rs (L8-10)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+```
+**File:** engine/protocol/src/progress.rs (L291-294)
+```rust
+/// Wire format shared by `transfer-progress` and `receive-progress`.
+pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
+    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
+}
+```
+**File:** frontend/src/lib/transfer-events.ts (L47-53)
+```typescript
+	const speedBps = Math.max(speedInt / 1000, 0)
+	const percentage =
+		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
+	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
+	const etaSeconds =
+		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
+
+```
+## Q4
+dashbeam_send_start函数在传输文件是会创建子进程吗，在透明加密环境，主程序有解密文件权限，请用dashbeam_send_start函数会出现无法解密现象吗
+### Answer
+User asks: does `dashbeam_send_start` spawn a subprocess when transferring files? In a transparent encryption (透明加密) environment, the main program has decrypt permission — would `dashbeam_send_start` fail to decrypt? Need to find the function in the codebase.User asks: does dashbeam_send_start create a subprocess? In a transparent encryption (透明加密) environment where main program has decrypt permission, would it fail to decrypt? There's no `dashbeam_send_start` in the codebase — likely the user's integration function name, or maybe a C FFI export. Check for FFI exports / process spawning.Check what Command uses in commands.rs and identity.rs — likely unrelated to file reading. Also check how files are read during import (std::fs / tokio fs in same process). Check import.rs file reading method.Question: does dashbeam_send_start create subprocess? There's no function named dashbeam_send_start in repo — likely the user's own wrapper. The send path runs in-process (tokio tasks, not subprocesses). Check whether import reads files in-process — yes, `db.add_path_with_opts` reads via iroh-blobs in the same process. TryReference mode references the file (may read lazily during transfer). Commands.rs Command:: match — likely file opener, not relevant. Answer.代码库里没有 `dashbeam_send_start` 这个函数名（全仓搜索无匹配），它应该是你侧封装/暴露的入口；实际的 Rust 实现是 `start_share_items`（`engine/native/src/send.rs:29`），Tauri 侧由 `commands.rs` 里的 start_sharing 命令调用它。 dashbeam:28-30 dashbeam:273-274 
+
+## 结论：不创建子进程，文件读取全部在主进程内完成
+
+- `start_share_items` 只创建 tokio 异步任务（`n0_future::task::spawn`）和内存中的 `Router`，没有 `std::process::Command`/`tokio::process` 调用。 dashbeam:191-201 
+- 我搜了整个仓库的进程调用（`Command::`、`std::process`、`tokio::process`），只出现在缩略图生成、右键菜单注册、身份密钥命令等外围功能，**发送链路上没有任何子进程**。 dashbeam:1-1 
+- 文件读取路径：`import_paths` → `db.add_path_with_opts(...)`，由 iroh-blobs 的 `Store` 在**同一进程**内打开文件并计算哈希/读取数据；`mode: ImportMode::TryReference` 表示尽量引用原路径，传输时才真正读文件内容（mmap/read），仍然是在本进程内。 dashbeam:43-47 
+- 并发也是线程级：`buffered_unordered(num_cpus::get())` 只是 tokio 任务并发，不是多进程。 dashbeam:67-68 
+
+## 对透明加密环境的影响
+
+既然读取发生在调用方进程（即加载 dashbeam 库/运行主程序的进程）本身，透明加密系统只要给**该进程**（通常是按进程名/路径配置的解密白名单）授予了解密权限，读到的就是解密后的明文，不会出现"无法解密"现象。
+
+需要留意的三个边界条件，都不是子进程问题：
+
+1. **权限是按进程粒度判定**：如果 dashbeam 以独立可执行文件（如 Tauri 应用 `dashbeam.exe`）运行，白名单要配这个 exe，而不是你的主程序 exe。如果你是把它作为库（cdylib）链接进主进程，则随主进程身份判定，无此问题。
+2. **`TryReference` 引用模式**：文件在传输期间按当前路径惰性读取。如果透明加密系统对"同一进程内不同线程/不同时间点"的解密策略一致，无影响；但若文件在分享期间被移动或加密策略改变，读取会失败或拿到密文。
+3. **进程内读取的是磁盘文件**：没有二次拷贝到临时目录再读的逻辑（发送侧 store 只存哈希和引用/复制数据到 `new_send_blobs_dir()` 自己的目录）。如果 `ImportMode` 落到复制模式，临时副本会写到 blob store 目录——该目录若以密文形式落地，读取方仍是本进程，权限一致即可。
+
+一个未验证点：`dashbeam_send_start` 如果是你封装层里 `CreateProcess`/`ShellExecute` 拉起 dashbeam CLI 的实现，那"子进程"是你封装层造的，不在 dashbeam 代码内——这种情况下透明加密白名单需要覆盖那个子进程 exe。建议确认你封装的实现方式。
+### Citations
+**File:** engine/native/src/send.rs (L28-30)
+```rust
+/// Starts sharing the provided paths (files or directories).
+pub async fn start_share_items(
+    paths: Vec<PathBuf>,
+```
+**File:** src-tauri/src/commands.rs (L1-1)
+```rust
+use crate::features::thumbnail::generate_thumbnail;
+```
+**File:** src-tauri/src/commands.rs (L273-274)
+```rust
+        let result = start_share_items(path_bufs.clone(), options, &boxed_handle, Some(metadata))
+            .await
+```
+**File:** engine/protocol/src/send.rs (L191-201)
+```rust
+    let progress_handle = n0_future::task::spawn(show_provide_progress_with_logging(
+        progress_rx,
+        app_handle.clone(),
+        size,
+        completed_peers.clone(),
+    ));
+
+    let router = iroh::protocol::Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, blobs)
+        .accept(METADATA_ALPN, MetadataProtocol { metadata })
+        .spawn();
+```
+**File:** engine/native/src/import.rs (L43-47)
+```rust
+                    let import = db.add_path_with_opts(AddPathOptions {
+                        path: file_path,
+                        mode: ImportMode::TryReference,
+                        format: BlobFormat::Raw,
+                    });
+```
+**File:** engine/native/src/import.rs (L67-68)
+```rust
+            .buffered_unordered(num_cpus::get())
+            .collect::<Vec<_>>()
+```
+## Q5
+如果主进程只有对pdf文件解密权限，那么通过在发送前把文件名重命名为带pdf扩展的方式，导出的start_share_items才可以解密，但是接收端得到的文件名也是带pdf，需要相应重命名，有没有一个方式在读取的时候是带pdf扩展，发送给接收端不带pdf扩展名
+### Answer
+Check how collection stores filenames — `entries` in import.rs uses `(String, TempTag, u64)` where name comes from path. If name could differ from disk path, you could read "file.pdf" but advertise "file". Check import.rs fully.Question: sender wants to read files as "x.pdf" on disk but receiver gets name "x" (original extension). Look at import: `collect_path_files` produces `(name, file_path)` pairs — name in collection and path on disk are already decoupled! The name comes from `stem`/`root_name`, while file_path is the disk path. For single file, name = stem = file name on disk. But the architecture supports decoupling: name is just the string in the Collection.
+
+So yes — you could rename on disk to `.pdf` for reading, but pass original name to the collection. However `import_paths` derives name from path.file_name(). To decouple, you'd need a small change: pass `(display_name, disk_path)` pairs. Alternatively: create a temp dir with... no, renaming the actual file.
+
+Alternative approach without code change: hardlink/symlink? In transparent encryption, the decoy extension only affects the display name. Options:
+
+1. Code change in `import_paths`/`collect_path_files`: decouple display name from disk path. `collect_path_files` already returns `(name, file_path)` — internally decoupled, but public API takes only paths and derives name from `path.file_name()`. Add an API variant accepting `(PathBuf disk_path, String display_name)`.
+
+2. No code change alternative: create a hardlink to the file with a `.pdf` name in a temp dir, pass that path — but then display name would be the link name `x.pdf` — wrong direction. Reverse: we want disk name `.pdf` (for decrypt permission) and display name original. So: rename real file to `x.pdf` on disk; create hardlink named `x`? Reading `x` wouldn't be `.pdf` for encryption policy—encryption usually checks the actual extension/path being read. If policy checks path extension of the opened file, opening through hardlink `x` wouldn't match. So code change is the clean way.
+
+Also note `FileMetadata` sent via METADATA_ALPN may include filename for the UI — check? metadata is passed separately; receiver display filename probably comes from collection names on export. Good enough.
+
+Answer: yes, feasible; the collection name is decoupled from disk path internally. Provide implementation sketch: extend `import_paths` with `import_named_paths(Vec<(PathBuf, String)>)` or rename file to `.pdf` on disk, then pass display name. Also for directories, `collect_path_files` builds names from relative path — would need mapping. Also mention metadata.filename might carry the name shown before download — check FileMetadata quickly? Probably fine; mention it may contain file name too.**可以实现** —— collection 里的文件名和磁盘路径在代码里本来就是解耦的，只是目前公开 API 只收 `paths`，名字是从 `path.file_name()` 推导的。需要一个小改动把"显示名"和"读取路径"分开传进来。
+
+## 现状分析
+
+`collect_path_files` 内部返回的就是 `(String name, PathBuf file_path)` 二元组：name 最终写进 `Collection`（接收端看到的文件名），`file_path` 是实际 `open()` 读数据的磁盘路径。两者在数据结构上已经分离。 dashbeam:160-164 
+
+`import_paths` 把 `entries` 里的 `(name, tag)` 写进 `Collection` —— name 只是 blob 标签，接收端 export 时按它落盘，与实际读取路径无关。 dashbeam:85-92 
+
+限制在于入口：`import_paths` 对每个 `path` 用 `path.file_name()` 生成 `stem` 作为根名，单文件场景 `rel = root_name`，所以名字被绑定成了磁盘文件名。 dashbeam:27-34 dashbeam:161-163 
+
+## 推荐做法：给 import 加"显示名"参数
+
+链路改动很小：
+
+1. `start_share_items`（`engine/native/src/send.rs:29`）的入参从 `Vec<PathBuf>` 扩展为 `Vec<(PathBuf, String)>`（磁盘路径 + 显示名），或新增 `start_share_named_items` 保兼容；
+2. `import_paths` 相应接受 `(path, display_name)`，传给 `collect_path_files` 时 `root_name` 用 display_name 而非 `path.file_name()` —— 单文件即 `x.pdf` 磁盘名读、`x` 显示名；目录场景在 `prefixed` 里同样用 display_name 做根目录名（文件部分仍取磁盘相对路径，若加密依赖扩展名，目录里每个文件改名后需要逐文件记录"磁盘名→显示名"映射，结构上要再传一层）；
+3. 调用方在发送前把磁盘文件 rename 为 `x.pdf`，传 `(disk_path="x.pdf", display_name="x")`。
+
+## 不改代码的替代方案及其问题
+
+- **硬链接**：rename 原文件为 `x.pdf` 后创建名为 `x` 的硬链接、把 `x` 传给 `start_share_items`。但这通常无效——透明加密策略一般按**打开时的路径扩展名**判定解密权限，通过 `x` 这个无扩展名路径打开就不会命中 pdf 白名单。方向反了，你想要的是打开 `x.pdf`、显示 `x`。
+- **临时副本**：把 `x.pdf` 解密后复制成无扩展名的临时文件再分享。可行但浪费磁盘、且明文落盘到 blob store 目录（`new_send_blobs_dir`），在加密管控环境下通常不被允许。 dashbeam:74-75 
+
+## 需要顺带检查的点
+
+- `FileMetadata`（`metadata` 参数，经 `METADATA_ALPN` 发给接收端）里如果携带文件名用于 UI 预展示，也要同步用 display_name，否则接收端界面会先显示 `x.pdf`。 dashbeam:33-34 
+- `TryReference` 模式下 blob 是对磁盘路径的引用：分享期间不能把这个 `x.pdf` 再改回去或移动，否则发送中断时读取失败。 dashbeam:43-47 
+- `dedup_name` 按 display_name 去重，改名后多个不同扩展名的磁盘文件若映射到同一显示名会自动加 `(2)` 后缀，属预期行为。 dashbeam:147-157
+### Citations
+**File:** engine/native/src/import.rs (L27-34)
+```rust
+    for path in paths {
+        let stem = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "item".to_string());
+
+        let import = collect_path_files(&path, &stem)?;
+```
+**File:** engine/native/src/import.rs (L43-47)
+```rust
+                    let import = db.add_path_with_opts(AddPathOptions {
+                        path: file_path,
+                        mode: ImportMode::TryReference,
+                        format: BlobFormat::Raw,
+                    });
+```
+**File:** engine/native/src/import.rs (L85-92)
+```rust
+    let (collection, tags) = entries
+        .into_iter()
+        .map(|(name, tag, _)| ((name, tag.hash()), tag))
+        .unzip::<_, _, Collection, Vec<_>>();
+
+    let temp_tag = collection.clone().store(db).await?;
+    drop(tags);
+    Ok((temp_tag, total_size, collection))
+```
+**File:** engine/native/src/import.rs (L147-157)
+```rust
+fn dedup_name(name: &str, seen: &mut BTreeMap<String, usize>) -> String {
+    match seen.get_mut(name) {
+        Some(count) => {
+            *count += 1;
+            format!("{} ({})", name, count)
+        }
+        None => {
+            seen.insert(name.to_string(), 1);
+            name.to_string()
+        }
+    }
+```
+**File:** engine/native/src/import.rs (L160-164)
+```rust
+fn collect_path_files(path: &Path, root_name: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    if path.is_file() {
+        let rel = canonicalized_path_to_string(PathBuf::from(root_name), true)?;
+        return Ok(vec![(rel, path.to_path_buf())]);
+    }
+```
+**File:** engine/native/src/send.rs (L33-34)
+```rust
+    metadata: Option<FileMetadata>,
+) -> anyhow::Result<SendResult> {
+```
+**File:** engine/native/src/send.rs (L74-75)
+```rust
+    let blobs_data_dir = storage::new_send_blobs_dir();
+    let canonical_paths = canonicalize_input_paths(paths)?;
+```
+## Q6
+改动代码，要求
+1. 对普通文件比如x.iso，主程序会重命名为x.iso.pdf，start_share_items函数接收磁盘路径 + 显示名
+2. 对文件夹，主程序也会递归重命名所有普通文件，start_share_items函数也只需要按1的规则就行
+### Answer
+User wants a code change plan. Ask-only mode — but instructions say creating plans is DISABLED in ask-only mode? "Important: Ask-only mode... Do NOT create plans or suggest implementation steps." But the section below says when to include a plan. Conflict: ask-only mode says don't output <plan>. The user asks to modify code. I should explain conceptually what needs to change without a plan? The ask-only directive explicitly says do not create plans. I'll describe the changes needed concisely, citing exact locations.
+
+Need to read import.rs fully and send.rs signature to be accurate.我先看一下相关代码再给出改动方案。Need to describe required changes. Check who calls start_share_items: commands.rs and start_share deprecated. Need display name mapping for directories too: requirement 2 says folder files renamed recursively `*.iso → *.iso.pdf`; "only need rule 1" — meaning the display name for each file inside dir should strip trailing `.pdf`? Actually "按1的规则" = per-file disk path + display name. For a dir, display names inside collection currently derived from relative disk path — which would contain `.pdf` suffixes. So the rename must be applied to relative components, not just root name.
+
+Design: change API to accept `Vec<(PathBuf, String /*display root name*/)>`; in collect_path_files for dirs, derive display rel path by stripping trailing ".pdf" from each file name? Requirement: main program renames all regular files recursively to +.pdf; the display name should be original. Simplest: in dir case, when building `rel`, strip a trailing ".pdf" extension from the last component (or from any component? only files). But keep a mapping? Simpler approach: pass a rename policy — for each disk file ending in `.pdf`, display name strips `.pdf`. But that would also strip a genuine `.pdf` file name... In this scheme every file has `.pdf` appended, including actual pdfs (`x.pdf → x.pdf.pdf`, display `x.pdf`). So strip one trailing `.pdf` is correct.
+
+Alternatively pass explicit per-file pairs: for directories, caller supplies disk path + display name per top-level item only; inside dir, apply strip-suffix rule. That matches "rule 1".
+
+Also check commands.rs call site signature (path_bufs). And frontend? The caller is user's own. Give a change spec with signatures.
+
+Should I produce a plan? Ask-only mode forbids <plan>. I'll describe changes.改动集中在 `import.rs` 和 `send.rs`，调用方在 `src-tauri/src/commands.rs:273`。下面是要改的点和理由。
+
+## 改动方案
+
+### 1. `import.rs`：导入时携带"显示名"
+
+**`collect_path_files` 增加一个"磁盘名→显示名"的转换规则**。当前签名 `fn collect_path_files(path: &Path, root_name: &str)` 内部已返回 `(显示名, 磁盘路径)` 二元组，结构不变，只改名字的生成方式：
+
+- **单文件分支**（`import.rs:161-163`）：显示名不用 `path.file_name()`，用调用方传入的 `root_name`。你传入 `x.iso`，磁盘读 `x.iso.pdf`，collection 里就是 `x.iso`。当前行为其实已经是这样——`stem` 来自 `file_name()`，所以只需把 `stem` 的来源换掉。
+- **目录分支**（`import.rs:166-189`）：`rel` 是从磁盘路径 `strip_prefix` 得到的相对路径，会带 `.pdf` 后缀。需要把 `rel` 的**文件名部分**去掉末尾一个 `.pdf` 后缀再拼 `prefixed`（即磁盘 `a/b.iso.pdf` → 显示 `a/b.iso`；磁盘 `a/b.pdf.pdf` → 显示 `a/b.pdf`，天然兼容真 pdf）。中间目录名不重命名（主程序只改文件名），保持不变。
+
+实现上加一个小函数即可：
+
+```rust
+fn strip_decoy_suffix(rel: &Path) -> PathBuf {
+    // 文件名去掉末尾 ".pdf"（若有），其余组件原样保留
+}
+```
+
+**`import_paths` 签名**（`import.rs:20`）改为：
+
+```rust
+pub async fn import_paths(
+    items: Vec<(PathBuf /*磁盘路径*/, String /*顶层显示名*/)>,
+    db: &Store,
+) -> ...
+```
+
+`stem` 直接用传入的显示名，不再 `path.file_name()` 推导（`import.rs:28-32` 删除）。
+
+**`canonicalize_input_paths`**（`import.rs:132`）保持不变，但调用处要只 canonicalize 磁盘路径部分，显示名不参与 canonicalize（它是纯展示字符串，可能根本不是磁盘上存在的名字）。
+
+### 2. `send.rs`：透传元组
+
+`start_share_items`（`send.rs:29`）签名改为：
+
+```rust
+pub async fn start_share_items(
+    items: Vec<(PathBuf, String)>,
+    options: SendOptions,
+    ...
+)
+```
+
+- `canonicalize_input_paths` 只作用于 `items` 里的 `PathBuf` 列，再和显示名重新配对（canonicalize 用 `BTreeSet` 去重保序，需对应改造为对 `(path, name)` 处理，或先 canonicalize 再 zip——注意 canonicalize 去重可能减少元素，按 canonicalized path 做 key 重建映射更稳妥）。
+- `entry_type_for_progress`（`send.rs:79-86`）逻辑不变，仍按磁盘路径判断 file/dir/collection。
+- 调用 `import_paths`（`send.rs:106`）改传元组。
+
+`start_share` 兼容壳（`send.rs:19-26`）相应包装：单路径时用 `path.file_name()` 作默认显示名，行为与旧版一致。
+
+### 3. `commands.rs` 调用处
+
+`start_share_items(path_bufs.clone(), ...)`（`commands.rs:273`）改为传 `(path, display_name)` 元组。Tauri 命令的参数 schema（`Vec<String>` → `Vec<{path, name}>`）和前端调用处要同步改——如果你只在自己封装层调 `start_share_items` 而不用 Tauri 命令，可跳过这层。
+
+## 需要注意的边界
+
+- **不要 strip 目录名**：透明加密只针对文件扩展名，目录名含 `.pdf` 也是巧合，目录分支只对最后一个组件做 strip。如果你希望目录名也能解耦（磁盘 `dir` 显示为别的名字），顶层显示名参数已覆盖它。
+- **真 pdf 文件**：规则统一为"磁盘文件名去一个 `.pdf`"，`x.pdf` 磁盘上是 `x.pdf.pdf`，显示 `x.pdf`，正确。但前提是主程序**无条件**给所有文件加 `.pdf`——如果它跳过本来就是 `.pdf` 的文件，那磁盘 `x.pdf` 会被显示成 `x`，需要在传入时区分（比如主程序记录哪些文件改过名）。这一点取决于主程序的改名策略，建议确认。
+- **`TryReference` 引用模式**（`import.rs:45`）：传输期间磁盘文件必须保持 `x.iso.pdf` 这个路径不动，改名还原要等分享结束。
+- **`FileMetadata`**：`metadata` 参数里若带文件名会经 `METADATA_ALPN` 发给接收端做 UI 预展示，调用方填 metadata 时记得用显示名，否则界面会先闪一下 `x.iso.pdf`。
+
+我处于只读问答模式，以上是改动规格；需要落地执行的话可以把这段交给 Devin 会话实施。

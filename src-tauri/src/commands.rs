@@ -4,6 +4,7 @@ use crate::history::{
     TransferContext,
 };
 use crate::state::{AppStateMutex, ShareHandle};
+use engine::ShareItem;
 use engine::{
     build_discovery_mode, download, fetch_metadata, get_relay_status as engine_get_relay_status,
     resolve_relay_mode_with_fallback, start_share_items,
@@ -270,7 +271,8 @@ pub async fn send_items(
         );
 
         // Ephemeral share — relay settings apply per session (all platforms including Android).
-        let result = start_share_items(path_bufs.clone(), options, &boxed_handle, Some(metadata))
+        let items: Vec<ShareItem> = path_bufs.iter().cloned().map(ShareItem::plain).collect();
+        let result = start_share_items(items, options, &boxed_handle, Some(metadata))
             .await
             .map_err(|error| {
                 // Without this, sender-side bug reports end at connection setup.
