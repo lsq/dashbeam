@@ -663,6 +663,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashbeam-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "sendme-native",
+ "sendme-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

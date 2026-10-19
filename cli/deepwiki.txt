@@ -1,0 +1,1520 @@
+#### GCC编译说明
+
+```bash
+g++ -o dashbeam-send.exe -Iengine/ffi/include cli/dashbeam-send.cpp -L engine/target/release -ldashbeam_ffi
+```
+
+#### DeepWiki
+
+# [DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam](https://deepwiki.com/search/senddllc_8fa0b884-9b06-497f-b855-1259478a3243)
+## Q1
+怎么把send功能导出为dll，供c++项目调用
+### Answer
+User asks how to export "send" functionality as a DLL for C++ consumption in dashbeam repo. Need to find what "send" is.Look at engine/native send.rs, Cargo.toml crate-type, existing FFI exports (wasm-bridge? export.rs?).Check src-tauri/Cargo.toml cdylib and AppHandle/EventEmitter abstraction (protocol::AppHandle) to see how to adapt for C++ callbacks.Provide conceptual answer: currently send lives in Rust (sendme-native crate, `start_share_items`, async tokio, depends on AppHandle/EventEmitter trait for progress events). No C FFI exists — the only cdylib is src-tauri (Tauri app) and wasm-bridge. To export as DLL need: crate-type cdylib, extern "C" functions, C ABI structs, tokio runtime management, callback for progress events instead of AppHandle. Outline steps and caveats. Respond in Chinese.当前代码里没有现成的 C FFI 导出 —— send 功能是纯 Rust 实现的，位于 `engine/native/src/send.rs` 的 `start_share_items`（以及已废弃的 `start_share`），通过 `engine/native/src/lib.rs:35` 以 `pub use send::{start_share, start_share_items}` 重导出。
+
+**目前的情况**
+
+- `engine/native`（crate 名 `sendme-native`）在 `engine/native/Cargo.toml` 中没有配置 `crate-type`，默认只产 `rlib`，不能直接生成 DLL。
+- 仓库里仅有的动态库是 `src-tauri`（Tauri 应用）和 `wasm-bridge`（wasm 目标），都不是给 C++ 用的 C ABI。
+- `start_share_items(paths, options, app_handle, metadata)` 是 `async` 函数，依赖 tokio 运行时，且 `app_handle: &AppHandle` 是 `protocol` crate 里定义的事件发射抽象（用于进度事件上报），C++ 侧无法直接提供。
+
+**要导出为 DLL，需要做这些事**
+
+1. 新建一个 FFI crate（或给 `sendme-native` 加 `crate-type = ["cdylib"]`），用 `cargo build --release` 产出 `.dll` + `.lib`。
+2. 写 `#[no_mangle] pub extern "C"` 包装函数，例如：
+   - `dashbeam_send_start(const char* const* paths, int count, const char* options_json, ProgressCallback cb, void* user_data) -> int handle`
+   - `dashbeam_send_cancel(int handle)`、`dashbeam_send_free(...)` 管理生命周期。
+3. `SendOptions` / `SendResult` / `FileMetadata` 是 serde 结构体，最简单的方式是跨边界传 JSON 字符串（`serde_json` 已在依赖里），避免手写 repr(C) 结构体。
+4. tokio 运行时：DLL 内部持有一个全局 `tokio::runtime::Runtime`（`OnceLock`），`extern "C"` 函数里 `runtime.spawn(start_share_items(...))`，因为导出函数本身不能是 async。
+5. `AppHandle`/`EventEmitter` 是 trait 抽象，可以实现一个"通过 C 函数指针回调"的版本，把进度事件 JSON 化后回调给 C++。
+6. C++ 侧写一个 `.h` 头文件声明函数签名（或用 `cbindgen` 自动生成），链接生成的 `.lib`。
+
+**注意事项**
+
+- 字符串/内存所有权要约定清楚：推荐 DLL 返回的字符串由 C++ 调 `free` 函数释放，避免跨 CRT 边界的内存问题。
+- `start_share` 已标注 deprecated，应只包装 `start_share_items`。
+- 回调可能在任意 tokio worker 线程触发，C++ 侧需要自行 marshal 到 UI 线程。
+- 依赖里有 `keyring`（`get_or_create_secret` 会用系统密钥环），在非桌面环境或权限受限场景要注意。
+
+如果你确认要把这个功能落地，我可以把这个任务交给后台 agent 执行。
+## Q2
+落地这个功能
+### Answer
+User wants to implement. But I'm in ask-only mode — instructions say do NOT create plans... Actually instructions conflict: "Ask-only mode" says do NOT create plans, but plan format section says include plan when user wants work done. The ask-only section says "Do NOT create plans or suggest implementation steps... If user asks to implement, explain conceptually." But also "If access to filesystem... would satisfy the prompt, then create a simple plan containing the user's request to forward to a background agent." The earlier assistant turn offered to hand off to a background agent. Safer: include a plan since creating plans section describes handing off to background agent. Ask-only says don't output <plan>. Hmm — "Important note" says if prompt needs filesystem, create a simple plan. I'll output a plan; that matches earlier offer to hand off.
+
+Need some repo detail to write plan. Let me quickly inspect key files: engine/native/Cargo.toml, send.rs signature, protocol AppHandle trait, lib.rs.Check protocol types for AppHandle/EventEmitter definition quickly.Read the relevant section of types.rs to know AppHandle/EventEmitter shape.Read the file region around AppHandle.Produce answer with plan. SendOptions isn't Serialize? It derives Debug, Default only — not Deserialize! Check: `#[derive(Debug, Default)]` — so JSON deserialization of SendOptions isn't available directly. The FFI crate will need its own repr of options or pass fields individually. Note that in the plan. RelayModeOption/DiscoveryModeOption contain non-serde types (iroh::RelayUrl, url::Url) — Url does implement serde? url::Url has serde feature; iroh::RelayUrl may implement Deserialize. Uncertain — simplest: pass options as individual simple args or a JSON that maps to a custom FFI options struct. Mention in plan.
+
+SendResult in types.rs of native — likely serde. Keep simple.
+
+Write answer + plan in Chinese.这个功能没有现成的 C FFI 层，需要新增一个 `cdylib` crate 把 `sendme-native` 的 `start_share_items` 包装成 C ABI。关键事实：
+
+- `start_share_items` 是 async 函数，签名在 `engine/native/src/send.rs:29`，参数为 `paths`、`SendOptions`、`&AppHandle`、`Option<FileMetadata>`。
+- `SendOptions`/`DiscoveryModeOption`/`RelayModeOption` 只 derive 了 `Debug`/`Default`（`engine/protocol/src/types.rs:19-45`），不能直接 `serde_json` 反序列化，FFI 层需要自定义简单选项类型再映射。
+- `AppHandle` 是 `Option<Arc<dyn EventEmitter>>`（`types.rs:5-17`），FFI 层可以实现一个把事件转成 C 函数指针回调的 `EventEmitter`。
+- `sendme-native` 当前 `[lib] name = "native"` 无 cdylib 配置（`engine/native/Cargo.toml:11`），建议新建独立 `engine/ffi` crate 避免影响 Tauri/wasm 目标。
+
+
+在 tonyantony300/dashbeam 仓库中新增一个 `cdylib` FFI crate，将 `sendme-native` 的发送功能以 C ABI 导出，供 C++ 项目通过 LoadLibrary/链接 .lib 调用。
+
+1. 新建 `engine/ffi` 目录，创建 `Cargo.toml`：package 名 `dashbeam-ffi`，`[lib] crate-type = ["cdylib"]`，依赖 `sendme-native`（path = "../native"）、`sendme-protocol`（path = "../protocol"）、`tokio`（features = ["full"]）、`serde`、`serde_json`、`anyhow`。把新 crate 加入 workspace（查看根 Cargo.toml 的 members 配置，若没有 workspace 则检查 engine 下各 crate 的组织方式并保持一致）。
+
+2. 实现 `engine/ffi/src/lib.rs`，包含：
+   - 全局 tokio runtime：`static RUNTIME: OnceLock<tokio::runtime::Runtime>`，`get_runtime()` 惰性初始化 multi-thread runtime。
+   - `#[no_mangle] pub extern "C" fn dashbeam_send_start(paths: *const *const c_char, path_count: usize, options_json: *const c_char, progress_cb: extern "C" fn(*const c_char, *const c_char, *mut c_void), user_data: *mut c_void) -> i64`：解析 UTF-8 路径数组和 options JSON，构造 `SendOptions`（注意 `SendOptions` 本身没有 serde derive，需在 FFI crate 定义自己的 serde 选项结构体再映射到 `protocol::SendOptions`，包括 `relay_mode`/`discovery_mode`/`ticket_type`/绑定地址等字段；enum 字段用字符串标签如 "Default"/"Disabled"/"Custom" 表示），然后在 runtime 里 `spawn` 调用 `native::start_share_items(paths, options, &app_handle, metadata)`，完成后把 `SendResult`（serde_json 序列化）通过 `progress_cb` 以 "send-completed"/"send-failed" 事件回调。返回一个句柄 ID（可用 `AtomicI64` 计数 + `DashMap`/`Mutex<HashMap>` 存 `JoinHandle`）。
+   - 实现 `struct CCallbackEmitter { cb, user_data }` 实现 `protocol::EventEmitter`：`emit_event`/`emit_event_with_payload` 把事件名和 payload 转成 `CString` 调 `cb`，封装成 `AppHandle`（`Some(Arc::new(...))`）传给 `start_share_items`。注意 `user_data` 需要 `Send + Sync`，用 `usize` 存原始指针并用 `unsafe impl Send/Sync`。
+   - `#[no_mangle] pub extern "C" fn dashbeam_send_cancel(handle: i64)`：`JoinHandle::abort()`。
+   - `#[no_mangle] pub extern "C" fn dashbeam_free_string(s: *mut c_char)`：释放 DLL 分配、由回调传递的字符串（如回调约定为 DLL 拥有则由调用方调此函数；更简单可约定回调内字符串仅在回调期间有效、不需要释放——选后者并在头文件注明）。
+   - 所有 extern 函数用 `std::panic::catch_unwind` 包裹，防止 panic 跨越 FFI 边界导致 UB。
+
+3. 生成头文件：添加 `cbindgen` 依赖或手写 `include/dashbeam.h` 声明上述函数和回调签名 `typedef void (*dashbeam_progress_cb)(const char* event, const char* payload_json, void* user_data);`，附 C++ 调用示例注释（LoadLibrary 或链接 dashbeam_ffi.lib）。
+
+4. 验证：`cargo build -p dashbeam-ffi --release` 产出 `target/release/dashbeam_ffi.dll`（Windows）/`.so`/`.dylib`，写一个最小 C++ smoke test 或 Rust 集成测试调用 `dashbeam_send_start` 发送一个临时文件验证编译和基本流程。
+
+约束：不要改动 `send.rs`/`protocol` 现有公共 API；`start_share` 已 deprecated 不导出；进度事件回调可能发生在 tokio worker 线程，在头文件注释中说明 C++ 侧需自行 marshal 到 UI 线程。
+## Q3
+给出具体代码（包含实现，头文件，最小c++ smoke test）
+### Answer
+Need actual signatures. Read key files: engine/native/src/send.rs, engine/protocol/src/types.rs, engine/native/Cargo.toml, lib.rs, engine/protocol EventEmitter trait.Need SendResult shape and check types.rs of native + whether SendResult's fields (router, temp_tag, AutoCleanupDir) are serializable — SendResult contains iroh Router probably; keep alive via handle. Let me check engine/native/src/types.rs quickly for SendResult, and check where engine crates sit (workspace? root Cargo.toml).Check progress events emitted names and root Cargo.toml glob returned nothing? glob "Cargo.toml" maybe needs "**/Cargo.toml". Check progress.rs for event names, and root Cargo.toml.Need event names emitted during share — check engine/protocol/src/send.rs emit_event calls. Also engine/Cargo.toml workspace members. One iteration left — batch both reads.Now write the full code: engine/ffi crate. Key facts:
+
+- Workspace members in engine/Cargo.toml; add "ffi".
+- `native::start_share_items(paths, SendOptions, &AppHandle, Option<FileMetadata>) -> anyhow::Result<SendResult>` — returns once the share is serving (router up, ticket ready). SendResult must be kept alive (dropping router/temp_tag/AutoCleanupDir kills the share). So handle stores SendResult; cancel drops it.
+- Events: "transfer-progress" payload "bytes:total:speed*1000", "transfer-started", "transfer-completed" JSON {durationMs,bytes,totalBytes}, "transfer-failed", "active-connection-count", "share-peer-connected".
+- SendOptions fields: relay_mode, discovery_mode, ticket_type, magic_ipv4/6. ticket_type uses FromStr (derive_more::FromStr) — "Id" etc; serde Deserialize also derived. Actually AddrInfoOptions derives Serialize/Deserialize, and uses_custom_infra/build_discovery_mode exist in protocol. FileMetadata is Deserialize — good.
+- RelayModeOption::Custom urls: Vec<iroh::RelayUrl>, auth_token. iroh::RelayUrl FromStr probably. DiscoveryModeOption::Custom { pkarr_relay_url: url::Url, dns_origin }. There's `build_discovery_mode` exported — signature unknown; safer to construct manually.
+- Rust edition note: lib name "native" so `use native::...`.
+
+Design:
+- dashbeam_send_start(paths array, count, options_json, cb, user_data) -> i64 handle (>0 ok, negative error codes? Return 0 on failure and provide dashbeam_last_error). Keep simple: return handle or -1.
+- Since start_share_items returns after router is online (async ~ok), we can block_on it in spawn? Simpler: spawn a task that calls start_share_items, then emits "share-ready" event with JSON {ticket,hash,size,entry_type} or "share-error". Handle map stores Option<SendResult> via Mutex<HashMap<i64, SendResult>> — SendResult must be Send+Sync to store; Router is Send; likely ok. Store in Mutex.
+- Cancel: remove from map and drop (drop router shuts down, AutoCleanupDir cleans dir).
+- Options JSON struct: {relay_mode: "default"|"disabled"|"custom", relay_urls: [...], relay_auth_token, discovery_mode: "default"|"custom", pkarr_relay_url, dns_origin, ticket_type: "Id"|..., ipv4_addr, ipv6_addr, metadata: {...}}.
+- FileMetadata passes through serde_json directly.
+- iroh::RelayUrl: FromStr — need iroh dep in ffi crate. url::Url parse — url dep.
+- catch_unwind wrapping.
+- EventEmitter impl with cb + user_data as usize; unsafe impl Send+Sync.
+- Handle leak: dashbeam_send_free releases handle without drop? Just use cancel.
+
+Also note release profile panic="abort" in workspace — cdylib with panic=abort means panics abort process; mention it. Actually panic=abort in profile applies workspace-wide for release builds; extern "C" functions aborting is fine-ish but catch_unwind won't help under panic=abort. Mention caveat.
+
+C++ smoke test: create temp file, call send_start, wait for "share-ready" event printing ticket, then sleep/cancel.
+
+Header file dashbeam.h.
+
+Write answer in Chinese, concise but complete code. Include Cargo.toml, lib.rs, dashbeam.h, main.cpp, and notes (workspace member add, event names, thread safety).基于代码库的实际情况（`native::start_share_items` 在 router 上线后就返回 `SendResult`，而 `SendResult` 持有 `Router`/`TempTag`/`AutoCleanupDir`，drop 即停止分享），完整实现如下。进度回调透传 `protocol` 层发出的事件名：`transfer-started`、`transfer-progress`（payload 为 `bytes:total:speed_mbps` 格式）、`transfer-completed`（JSON `{durationMs,bytes,totalBytes}`）、`transfer-failed`、`active-connection-count`、`share-peer-connected`。
+
+## 1. `engine/Cargo.toml` — workspace members 加 `"ffi"`
+
+```toml
+members = [".", "protocol", "native", "wasm-io", "ffi"]
+```
+
+## 2. `engine/ffi/Cargo.toml`
+
+```toml
+[package]
+name = "dashbeam-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.91"
+
+[lib]
+name = "dashbeam_ffi"
+crate-type = ["cdylib"]
+
+[dependencies]
+native = { path = "../native", package = "sendme-native" }
+protocol = { path = "../protocol", package = "sendme-protocol" }
+anyhow = "1.0.75"
+iroh = "1.0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.108"
+tokio = { version = "1.34.0", features = ["full"] }
+url = "2"
+```
+
+## 3. `engine/ffi/src/lib.rs`
+
+```rust
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
+use std::net::{SocketAddrV4, SocketAddrV6};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use protocol::{
+    AddrInfoOptions, AppHandle, DiscoveryModeOption, EventEmitter, FileMetadata,
+    RelayModeOption, SendOptions,
+};
+use native::{start_share_items, SendResult};
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("dashbeam tokio runtime")
+    })
+}
+
+/// Live share sessions keyed by handle. Dropping a SendResult shuts the router
+/// down and auto-cleans the blobs dir, so removal == cancel.
+fn sessions() -> &'static Mutex<HashMap<i64, SendResult>> {
+    static S: OnceLock<Mutex<HashMap<i64, SendResult>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn last_error_slot() -> &'static Mutex<Option<CString>> {
+    static E: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
+    E.get_or_init(|| Mutex::new(None))
+}
+
+fn set_last_error(msg: &str) {
+    if let Ok(mut slot) = last_error_slot().lock() {
+        *slot = CString::new(msg).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Options (JSON) -> protocol::SendOptions
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FfiSendOptions {
+    /// "default" | "disabled" | "custom"
+    relay_mode: String,
+    /// relay_mode = "custom" 时的 relay URL 列表
+    relay_urls: Vec<String>,
+    relay_auth_token: Option<String>,
+    /// "default" | "custom"
+    discovery_mode: String,
+    pkarr_relay_url: Option<String>,
+    dns_origin: Option<String>,
+    /// "Id" | "RelayAndAddresses" | "Relay" | "Addresses"
+    ticket_type: String,
+    /// e.g. "0.0.0.0:0"
+    ipv4_addr: Option<String>,
+    ipv6_addr: Option<String>,
+    /// 可选文件元数据（直接透传 protocol::FileMetadata 的 serde 形状）
+    metadata: Option<FileMetadata>,
+}
+
+fn map_options(o: FfiSendOptions) -> anyhow::Result<(SendOptions, Option<FileMetadata>)> {
+    let relay_mode = match o.relay_mode.as_str() {
+        "" | "default" => RelayModeOption::Default,
+        "disabled" => RelayModeOption::Disabled,
+        "custom" => {
+            let urls = o
+                .relay_urls
+                .iter()
+                .map(|s| iroh::RelayUrl::from_str(s).map_err(|e| anyhow::anyhow!("bad relay url {s}: {e}")))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            RelayModeOption::Custom { urls, auth_token: o.relay_auth_token }
+        }
+        other => anyhow::bail!("unknown relay_mode: {other}"),
+    };
+
+    let discovery_mode = match o.discovery_mode.as_str() {
+        "" | "default" => DiscoveryModeOption::Default,
+        "custom" => {
+            let url = o
+                .pkarr_relay_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("custom discovery requires pkarr_relay_url"))
+                .and_then(|s| url::Url::parse(s).map_err(|e| anyhow::anyhow!("bad pkarr url: {e}")))?;
+            DiscoveryModeOption::Custom { pkarr_relay_url: url, dns_origin: o.dns_origin }
+        }
+        other => anyhow::bail!("unknown discovery_mode: {other}"),
+    };
+
+    let ticket_type = if o.ticket_type.is_empty() {
+        AddrInfoOptions::Id
+    } else {
+        AddrInfoOptions::from_str(&o.ticket_type)
+            .map_err(|e| anyhow::anyhow!("bad ticket_type: {e}"))?
+    };
+
+    let magic_ipv4_addr = o
+        .ipv4_addr
+        .as_deref()
+        .map(SocketAddrV4::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("bad ipv4_addr: {e}"))?;
+    let magic_ipv6_addr = o
+        .ipv6_addr
+        .as_deref()
+        .map(SocketAddrV6::from_str)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("bad ipv6_addr: {e}"))?;
+
+    Ok((
+        SendOptions { relay_mode, discovery_mode, ticket_type, magic_ipv4_addr, magic_ipv6_addr },
+        o.metadata,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// EventEmitter -> C callback
+// ---------------------------------------------------------------------------
+
+/// event/payload 字符串仅在回调执行期间有效，C++ 侧需要复制。
+pub type DashbeamEventCb = extern "C" fn(*const c_char, *const c_char, *mut c_void);
+
+struct CbEmitter {
+    cb: DashbeamEventCb,
+    user_data: usize, // 原始指针按值传递
+}
+
+unsafe impl Send for CbEmitter {}
+unsafe impl Sync for CbEmitter {}
+
+impl CbEmitter {
+    fn fire(&self, name: &str, payload: Option<&str>) -> Result<(), String> {
+        let name = CString::new(name).map_err(|e| e.to_string())?;
+        let payload = match payload {
+            Some(p) => CString::new(p).map_err(|e| e.to_string())?,
+            None => CString::new("").map_err(|e| e.to_string())?,
+        };
+        (self.cb)(name.as_ptr(), payload.as_ptr(), self.user_data as *mut c_void);
+        Ok(())
+    }
+}
+
+impl EventEmitter for CbEmitter {
+    fn emit_event(&self, event_name: &str) -> Result<(), String> {
+        self.fire(event_name, None)
+    }
+    fn emit_event_with_payload(&self, event_name: &str, payload: &str) -> Result<(), String> {
+        self.fire(event_name, Some(payload))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C ABI
+// ---------------------------------------------------------------------------
+
+/// 启动分享。立即返回句柄（>0）；分享就绪后以 "share-ready" 事件回调
+/// {"ticket","hash","size","entry_type"}，失败回调 "share-error"（payload 为错误文本）。
+/// options_json 可为 NULL（全默认）。返回 -1 表示参数错误，错误文本见 dashbeam_last_error。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_start(
+    paths: *const *const c_char,
+    path_count: usize,
+    options_json: *const c_char,
+    event_cb: Option<DashbeamEventCb>,
+    user_data: *mut c_void,
+) -> i64 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if paths.is_null() || path_count == 0 {
+            return Err(anyhow::anyhow!("paths is null or empty"));
+        }
+        let mut path_list = Vec::with_capacity(path_count);
+        for i in 0..path_count {
+            let p = unsafe { *paths.add(i) };
+            if p.is_null() {
+                return Err(anyhow::anyhow!("paths[{i}] is null"));
+            }
+            let s = unsafe { CStr::from_ptr(p) }
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("paths[{i}] not utf-8: {e}"))?;
+            path_list.push(PathBuf::from(s));
+        }
+
+        let (options, metadata) = if options_json.is_null() {
+            (SendOptions::default(), None)
+        } else {
+            let json = unsafe { CStr::from_ptr(options_json) }
+                .to_str()
+                .map_err(|e| anyhow::anyhow!("options not utf-8: {e}"))?;
+            let ffi_opts: FfiSendOptions = serde_json::from_str(json)
+                .map_err(|e| anyhow::anyhow!("bad options json: {e}"))?;
+            map_options(ffi_opts)?
+        };
+
+        let handle_id = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
+
+        // AppHandle: 有回调就包一层 CbEmitter，没有则为 None
+        let app_handle: AppHandle = event_cb.map(|cb| {
+            Arc::new(CbEmitter { cb, user_data: user_data as usize }) as Arc<dyn EventEmitter>
+        });
+
+        let cb = event_cb;
+        let ud = user_data as usize;
+
+        runtime().spawn(async move {
+            let emit = |name: &str, payload: &str| {
+                if let Some(cb) = cb {
+                    if let (Ok(n), Ok(p)) = (CString::new(name), CString::new(payload)) {
+                        cb(n.as_ptr(), p.as_ptr(), ud as *mut c_void);
+                    }
+                }
+            };
+
+            match start_share_items(path_list, options, &app_handle, metadata).await {
+                Ok(result) => {
+                    let ready = serde_json::json!({
+                        "handle": handle_id,
+                        "ticket": result.ticket,
+                        "hash": result.hash,
+                        "size": result.size,
+                        "entry_type": result.entry_type,
+                    });
+                    emit("share-ready", &ready.to_string());
+                    sessions()
+                        .lock()
+                        .expect("sessions poisoned")
+                        .insert(handle_id, result);
+                }
+                Err(e) => {
+                    emit("share-error", &format!("{e:#}"));
+                }
+            }
+        });
+
+        Ok(handle_id)
+    }));
+
+    match result {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            set_last_error(&format!("{e:#}"));
+            -1
+        }
+        Err(_) => {
+            set_last_error("panic in dashbeam_send_start");
+            -1
+        }
+    }
+}
+
+/// 取消分享并释放句柄。成功返回 0，句柄不存在返回 -1。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_stop(handle: i64) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        sessions().lock().expect("sessions poisoned").remove(&handle)
+    })) {
+        Ok(Some(_)) => 0, // drop SendResult -> router 关闭、目录清理
+        Ok(None) => {
+            set_last_error("unknown handle");
+            -1
+        }
+        Err(_) => {
+            set_last_error("panic in dashbeam_send_stop");
+            -1
+        }
+    }
+}
+
+/// 已完成完整传输的对端数（share 会话内累计）。
+#[no_mangle]
+pub extern "C" fn dashbeam_send_completed_peers(handle: i64) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        sessions()
+            .lock()
+            .expect("sessions poisoned")
+            .get(&handle)
+            .map(|r| r.completed_peers() as i64)
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// 返回最后一次错误的线程不安全字符串（仅在下次 FFI 调用前有效）。可为 NULL。
+#[no_mangle]
+pub extern "C" fn dashbeam_last_error() -> *const c_char {
+    last_error_slot()
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|c| c.as_ptr()))
+        .unwrap_or(std::ptr::null())
+}
+```
+
+## 4. `engine/ffi/include/dashbeam.h`
+
+```c
+#ifndef DASHBEAM_H
+#define DASHBEAM_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef _WIN32
+#  ifdef DASHBEAM_BUILD
+#    define DASHBEAM_API __declspec(dllexport)
+#  else
+#    define DASHBEAM_API __declspec(dllimport)
+#  endif
+#else
+#  define DASHBEAM_API
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * 进度/生命周期事件回调。
+ *   event:   "share-ready" | "share-error" | "transfer-started" |
+ *            "transfer-progress" | "transfer-completed" | "transfer-failed" |
+ *            "active-connection-count" | "share-peer-connected"
+ *   payload: share-ready -> {"handle","ticket","hash","size","entry_type"}
+ *            share-error -> 错误文本
+ *            transfer-progress -> "bytes:total:speed*1000"（冒号分隔）
+ *            transfer-completed -> {"durationMs","bytes","totalBytes"}
+ *            active-connection-count / share-peer-connected -> 文本/JSON
+ * 注意：回调发生在 tokio worker 线程上；event/payload 仅在回调期间有效，
+ * 需要保留请自行复制；如需更新 UI 请 marshal 到 UI 线程。
+ */
+typedef void (*dashbeam_event_cb)(const char *event,
+                                  const char *payload,
+                                  void *user_data);
+
+/*
+ * options_json 可为 NULL（等价于 "{}"）。字段全部可选：
+ * {
+ *   "relay_mode": "default"|"disabled"|"custom",
+ *   "relay_urls": ["https://..."],          // custom 时必填
+ *   "relay_auth_token": "...",              // 可选
+ *   "discovery_mode": "default"|"custom",
+ *   "pkarr_relay_url": "https://...",       // custom discovery 必填
+ *   "dns_origin": "example.com",            // 可选
+ *   "ticket_type": "Id"|"RelayAndAddresses"|"Relay"|"Addresses",
+ *   "ipv4_addr": "0.0.0.0:0",
+ *   "ipv6_addr": "[::]:0",
+ *   "metadata": {"file_name":"...","item_count":1,"size":123,...}
+ * }
+ *
+ * 返回 >0 的句柄；返回 -1 时调用 dashbeam_last_error() 取错误。
+ */
+DASHBEAM_API int64_t dashbeam_send_start(const char *const *paths,
+                                         size_t path_count,
+                                         const char *options_json,
+                                         dashbeam_event_cb event_cb,
+                                         void *user_data);
+
+/* 停止并释放分享会话。返回 0 成功，-1 句柄无效。 */
+DASHBEAM_API int32_t dashbeam_send_stop(int64_t handle);
+
+/* 已完成传输的对端数；句柄无效返回 -1。 */
+DASHBEAM_API int64_t dashbeam_send_completed_peers(int64_t handle);
+
+/* 最近一次的 FFI 错误文本；无错误返回 NULL。指针内部持有，不要 free。 */
+DASHBEAM_API const char *dashbeam_last_error(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* DASHBEAM_H */
+```
+
+## 5. 最小 C++ smoke test — `smoke/main.cpp`
+
+```cpp
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <chrono>
+#include "dashbeam.h"
+
+static std::atomic<bool> g_ready{false};
+static std::atomic<bool> g_failed{false};
+
+static void on_event(const char *event, const char *payload, void *user_data) {
+    (void)user_data;
+    std::printf("[event] %s: %s\n", event, payload ? payload : "");
+    std::fflush(stdout);
+    if (std::strcmp(event, "share-ready") == 0) g_ready = true;
+    if (std::strcmp(event, "share-error") == 0) g_failed = true;
+}
+
+int main() {
+    // 1. 造一个临时文件
+    const char *path = "dashbeam_smoke.txt";
+    {
+        std::ofstream f(path);
+        f << "hello dashbeam\n";
+    }
+
+    // 2. 启动分享（默认选项：n0 discovery + 默认 relay + Id 类型 ticket）
+    const char *paths[] = {path};
+    int64_t h = dashbeam_send_start(paths, 1, nullptr, on_event, nullptr);
+    if (h < 0) {
+        std::fprintf(stderr, "send_start failed: %s\n",
+                     dashbeam_last_error());
+        return 1;
+    }
+    std::printf("handle=%lld, waiting for share-ready...\n",
+                (long long)h);
+
+    // 3. 等就绪（首次需上线 relay，最多等 30s）
+    for (int i = 0; i < 300 && !g_ready && !g_failed; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (g_failed) { dashbeam_send_stop(h); return 1; }
+    if (!g_ready) {
+        std::fprintf(stderr, "timeout waiting for share-ready\n");
+        dashbeam_send_stop(h);
+        return 1;
+    }
+
+    // 4. 模拟分享会话存活一段时间，等待对端拉取
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::printf("completed_peers=%lld\n",
+                (long long)dashbeam_send_completed_peers(h));
+
+    // 5. 停止
+    if (dashbeam_send_stop(h) != 0)
+        std::fprintf(stderr, "stop failed: %s\n", dashbeam_last_error());
+    return 0;
+}
+```
+
+MSVC 编译：`cl /std:c++17 /I engine\ffi\include smoke\main.cpp target\release\dashbeam_ffi.lib`。运行时把 `dashbeam_ffi.dll` 放到 exe 旁边。
+
+## 注意事项
+
+- **生命周期语义**：`dashbeam_send_start` 返回时分享还没就绪，`share-ready` 回调里才有 `ticket`（可直接给接收端用）。句柄在 `share-ready` 之后才会注册进 map —— 在 ready 前调 `dashbeam_send_stop` 可能返回 -1 但任务仍会跑完一轮启动流程。
+- **`panic = "abort"`**：workspace release profile 设了 `panic = "abort"`（`engine/Cargo.toml:64`），对 cdylib 来说 panic 会直接终止宿主进程，`catch_unwind` 形同虚设。如果要给 C++ 用，建议在 profile 里改成 `panic = "unwind"`，或把该 profile 移到用 `panic="abort"` 的具体 crate（注意 workspace profile 只能定义在根）。这是一个实际风险，不是风格问题。
+- **`keyring` 依赖**：`sendme-native` 依赖 `keyring`（`engine/native/Cargo.toml:30`），但在 `send.rs:42` 路径上 secret 实际走 `IROH_SECRET` 环境变量或随机生成（`types.rs:205`），不会触密钥环。
+- **回调线程**：事件回调在 tokio worker 线程触发，C++ 侧不要在里面做耗时操作或假设 UI 线程。
+- 我没能验证 `iroh::RelayUrl::from_str` / `AddrInfoOptions::from_str` 的确切错误类型（用了 `derive_more::FromStr`，map_err 处理成字符串即可编译），编译时如有签名出入按报错微调即可。
+## Q4
+给我写一个完整调用dashbeam_ffi.dll 命令行端cpp，要求
+1. 和原gui功能类似，参数可以为多个文件或者文件夹
+2. 使用公共iroh中继，返回ticket
+### Answer
+Need to produce a complete CLI C++ program calling dashbeam_ffi.dll. Maybe verify event names/ticket JSON fields — already have from previous context. I could quickly check send.rs to confirm share-ready payload fields (ticket, hash, size, entry_type) and ticket_type "Id" semantics. I have enough. Write the CLI: accepts multiple file/dir args, uses default options (public iroh relay = "default" relay_mode + "default" discovery), prints ticket, waits for peers, Ctrl+C handling.
+
+Provide build instructions with MSVC. Concise.基于前面实现的 `dashbeam_ffi.dll` ABI，下面是完整的命令行发送端。默认选项（`options_json` 传 `nullptr`）即使用公共 iroh 基础设施：n0 公共 discovery + 默认公共 relay + `Id` 类型 ticket，等价于 GUI 的默认行为。
+
+## `cli/dashbeam-send.cpp`
+
+```cpp
+// dashbeam-send: 通过 dashbeam_ffi.dll 分享文件/文件夹的命令行工具
+// 用法: dashbeam-send <文件或目录> [更多路径...]
+// 使用公共 iroh relay/discovery（默认），打印 ticket 供接收端使用。
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
+#include "dashbeam.h"
+
+namespace fs = std::filesystem;
+
+static std::atomic<bool> g_ready{false};
+static std::atomic<bool> g_failed{false};
+static std::atomic<bool> g_quit{false};
+static std::atomic<int64_t> g_handle{-1};
+static int g_connected_peers = 0;
+
+static void on_event(const char *event, const char *payload, void *user_data) {
+    (void)user_data;
+    const char *p = payload ? payload : "";
+
+    if (std::strcmp(event, "share-ready") == 0) {
+        // payload: {"handle","ticket","hash","size","entry_type"}
+        std::string json(p);
+        // 简单提取 ticket 字段（ticket 内不含引号/逗号）
+        auto pos = json.find("\"ticket\":\"");
+        if (pos != std::string::npos) {
+            pos += 10;
+            auto end = json.find('"', pos);
+            std::string ticket = json.substr(pos, end - pos);
+            std::printf("\n=== 分享已就绪 ===\n");
+            std::printf("ticket: %s\n", ticket.c_str());
+            std::printf("(完整回执: %s)\n\n", p);
+            std::printf("等待接收端连接... Ctrl+C 停止分享\n");
+        } else {
+            std::printf("[share-ready] %s\n", p);
+        }
+        g_ready = true;
+    } else if (std::strcmp(event, "share-error") == 0) {
+        std::fprintf(stderr, "[share-error] %s\n", p);
+        g_failed = true;
+    } else if (std::strcmp(event, "share-peer-connected") == 0) {
+        ++g_connected_peers;
+        std::printf("[peer] 新对端连接 (累计 %d): %s\n", g_connected_peers, p);
+    } else if (std::strcmp(event, "transfer-started") == 0) {
+        std::printf("[transfer] 开始传输\n");
+    } else if (std::strcmp(event, "transfer-progress") == 0) {
+        // payload: "bytes:total:speed*1000"
+        uint64_t bytes = 0, total = 0, speedx1000 = 0;
+        if (std::sscanf(p, "%llu:%llu:%llu",
+                        (unsigned long long *)&bytes,
+                        (unsigned long long *)&total,
+                        (unsigned long long *)&speedx1000) == 3) {
+            double pct = total ? 100.0 * bytes / total : 0.0;
+            std::printf("\r[transfer] %llu/%llu bytes (%.1f%%)  %.2f MB/s   ",
+                        (unsigned long long)bytes, (unsigned long long)total,
+                        pct, speedx1000 / 1000.0);
+            std::fflush(stdout);
+        }
+    } else if (std::strcmp(event, "transfer-completed") == 0) {
+        std::printf("\n[transfer] 完成: %s\n", p);
+    } else if (std::strcmp(event, "transfer-failed") == 0) {
+        std::printf("\n[transfer] 失败: %s\n", p);
+    }
+    // "active-connection-count" 等事件太吵，不打印
+}
+
+#ifdef _WIN32
+static BOOL WINAPI console_ctrl(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
+        g_quit = true;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
+static void sigint_handler(int) { g_quit = true; }
+#endif
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8); // 保证 ticket/中文输出不乱码
+    SetConsoleCtrlHandler(console_ctrl, TRUE);
+#else
+    std::signal(SIGINT, sigint_handler);
+#endif
+
+    if (argc < 2) {
+        std::fprintf(stderr,
+            "用法: %s <文件或目录> [更多路径...]\n"
+            "支持同时传入多个文件和文件夹，将打包为一次分享并输出 ticket。\n",
+            argv[0]);
+        return 2;
+    }
+
+    // 1. 校验并收集路径（文件或目录均可，与 GUI 的 start_share_items 一致）
+    std::vector<std::string> storage;
+    std::vector<const char *> paths;
+    for (int i = 1; i < argc; ++i) {
+        std::error_code ec;
+        fs::path p = fs::absolute(argv[i], ec);
+        if (ec || !fs::exists(p, ec)) {
+            std::fprintf(stderr, "路径不存在: %s\n", argv[i]);
+            return 2;
+        }
+        storage.push_back(p.string());
+        paths.push_back(storage.back().c_str());
+        std::printf("添加: %s\n", storage.back().c_str());
+    }
+
+    // 2. 启动分享。options_json=nullptr -> 公共 iroh relay + n0 discovery + Id ticket
+    int64_t h = dashbeam_send_start(paths.data(), paths.size(),
+                                    nullptr, on_event, nullptr);
+    if (h < 0) {
+        const char *err = dashbeam_last_error();
+        std::fprintf(stderr, "启动分享失败: %s\n", err ? err : "unknown");
+        return 1;
+    }
+    g_handle = h;
+    std::printf("正在上线（公共 iroh relay）...\n");
+
+    // 3. 等待 share-ready / share-error（首次建 relay 连接可能需要十几秒）
+    for (int i = 0; i < 600 && !g_ready && !g_failed && !g_quit; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    if (g_failed) { dashbeam_send_stop(h); return 1; }
+    if (!g_ready) {
+        std::fprintf(stderr, "%s\n", g_quit ? "已取消" : "等待 share-ready 超时");
+        dashbeam_send_stop(h);
+        return 1;
+    }
+
+    // 4. 保持分享会话存活，直到 Ctrl+C
+    while (!g_quit)
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    std::printf("\n正在停止分享...\n");
+    if (dashbeam_send_stop(h) != 0) {
+        const char *err = dashbeam_last_error();
+        std::fprintf(stderr, "停止失败: %s\n", err ? err : "unknown");
+        return 1;
+    }
+    std::printf("已停止。\n");
+    return 0;
+}
+```
+
+## 构建（MSVC）
+
+```bat
+:: 先构建 DLL
+cargo build -p dashbeam-ffi --release
+
+:: 编译 CLI（dashbeam_ffi.lib 在同目录 target\release 下）
+cl /std:c++17 /EHsc /I engine\ffi\include cli\dashbeam-send.cpp ^
+   target\release\dashbeam_ffi.lib /Fe:dashbeam-send.exe
+
+:: 运行时把 target\release\dashbeam_ffi.dll 复制到 exe 旁边
+```
+
+## 使用
+
+```bat
+dashbeam-send.exe photo.jpg C:\Users\me\docs report.pdf
+```
+
+输出示例：
+
+```
+添加: C:\...\photo.jpg
+添加: C:\...\docs
+正在上线（公共 iroh relay）...
+
+=== 分享已就绪 ===
+ticket: blobaaaaaaaa...
+等待接收端连接... Ctrl+C 停止分享
+
+[peer] 新对端连接 (累计 1): {"node_id":"..."}
+[transfer] 开始传输
+[transfer] 52428800/104857600 bytes (50.0%)  12.34 MB/s
+[transfer] 完成: {"durationMs":8500,"bytes":104857600,...}
+```
+
+## 说明
+
+- **多文件/文件夹**：`dashbeam_send_start` 接受路径数组，内部走 `start_share_items`，与 GUI 一致地把多个条目打成一个集合分享，返回单个 ticket。
+- **公共 relay**：`options_json` 传 `nullptr` 即 `SendOptions::default()` → `RelayModeOption::Default` + `DiscoveryModeOption::Default`（n0 公共服务），`ticket_type` 为 `Id`，ticket 只含 node id + hash，接收端经公共 relay 连接。
+- 若想指定自建基础设施，把 `nullptr` 换成 JSON 字符串，如 `{"relay_mode":"custom","relay_urls":["https://..."],"discovery_mode":"custom","pkarr_relay_url":"https://..."}`。
+- `share-ready` payload 里的 JSON 解析用了简单的子串提取；生产环境建议引入 nlohmann/json。
+## Q5
+返回的ticket在接收端提示，Failed to receive file: error: Connection failed: No addressing information available
+### Answer
+The error "No addressing information available" — the receiver can't resolve the sender's node id. Likely because ticket_type "Id" only contains node id, and receiver needs discovery (n0 DNS/pkarr) or relay info. Possibilities: receiver app has discovery disabled, or ticket published to pkarr but receiver can't resolve because sender's discovery publish didn't happen, or the receive path needs RelayAndAddresses ticket. Let me check the receive code and discovery implementation.The error "No addressing information available" means the ticket contains only node id (ticket_type Id) and receiver couldn't resolve addressing info via discovery. Possible causes:
+
+1. Sender's endpoint didn't publish to n0 DNS discovery — because our FFI used `DiscoveryModeOption::Default`, but does the send side actually publish? Need to check how send.rs builds endpoint/discovery. If the sender used `presets::Minimal` or didn't enable n0 DNS publish, the ticket with only Id can't be resolved.
+
+2. Or the sender's DNS publish happens but needs time; or share-ready emitted before publish propagated.
+
+3. Or receiver's discovery is n0 but ticket resolution requires pkarr publish which only happens if sender has n0 discovery enabled.
+
+Check send.rs endpoint builder to see what discovery is used and whether ticket emitted before endpoint online/published.The send side publishes to pkarr n0 DNS when ticket_type == Id and discovery is Default (send.rs:62-63). The receiver resolves via DnsAddressLookup::n0_dns() only when ticket has no relay/ip addrs (receive.rs:42-56). So "No addressing information available" means DNS resolution failed or hasn't propagated yet — or the sender's pkarr publish failed/hadn't completed, or the receiving machine can't reach n0 DNS (uses DNS-over-HTTPS? n0_dns uses standard DNS TXT lookup on dns.iroh.link — corporate firewalls may block). Also possible: our FFI emits "share-ready" immediately after run_share_session returns; the publish may lag. Another big possibility: receiver is the GUI which uses fetch_metadata with presets::N0 — fine. But "No addressing information available" is returned instantly when ticket contains Id only and the address lookup returned nothing — could be the receiver used custom infra, or receiver's DNS can't resolve, or publish hadn't propagated yet (pkarr publish is async, takes a few seconds).
+
+Also check run_share_session — when does it produce the ticket? Maybe ticket uses endpoint.addr() which waits for relay. If ticket_type=Id, ticket only has node id, relying on DNS publish which races. Suggest fix: use "RelayAndAddresses" ticket type so ticket embeds relay URL — then receiver doesn't need DNS at all. In FFI options_json pass {"ticket_type":"RelayAndAddresses"}. But does ticket include relay only after endpoint connected to relay? run_share_session probably waits for relay online. Check run_share_session quickly to confirm ticket construction/timing.One iteration left. Read send.rs run_share_session portion to check ticket timing and whether it waits for relay/dns publish.Diagnose the error. Receiver side: `download` builds endpoint with `presets::Minimal` and only adds an address lookup (DnsAddressLookup::n0_dns() or custom pkarr) **if the ticket contains no relay URLs and no IP addrs** (receive.rs:42). With `ticket_type = "Id"` the ticket has only the node id, so receiver must resolve via n0 DNS. "No addressing information available" = DNS lookup returned nothing — either the sender's pkarr publish hadn't propagated/failed, or the receiver can't reach n0 DNS.
+
+Sender publishes via PkarrPublisher::n0_dns() only when discovery=Default AND ticket_type==Id (send.rs:61-64). Our FFI defaults: discovery default → presets::N0 builder + PkarrPublisher::n0_dns — publish is async and `start_share_items` returns as soon as run_share_session returns with a ticket, likely before DNS publish propagates.
+
+Fixes:
+1. Easiest: use ticket_type "RelayAndAddresses" so ticket embeds relay URL + direct addrs — receiver needs no DNS at all (receive.rs:42 check skipped since ticket has addrs).
+2. Keep Id ticket but wait a few seconds after share-ready before giving ticket out (publish propagation).
+3. Check receiver side uses Default discovery; if receiver was configured with custom discovery/pkarr it won't query n0 DNS.
+4. Also relay must be connected: Id-only ticket requires sender to publish addr info incl. home relay; if relay_mode disabled, publish may contain only IPs or fail.
+
+Update CLI: pass options_json = {"ticket_type":"RelayAndAddresses"} — but wait, AddrInfoOptions variants names? From prior: "Id"|"RelayAndAddresses"|"Relay"|"Addresses". Recommend "RelayAndAddresses". Caveat: I couldn't verify run_share_session details (whether it waits for relay before producing ticket). Provide answer.这个错误发生在接收端 `download`（`engine/native/src/receive.rs:42-56` 和 `engine/protocol/src/receive.rs:137-151`）：ticket 里只有 node id（`ticket_type = "Id"`），没有任何 relay URL 或直连地址，接收端只能去 n0 DNS discovery 查询该 id 对应的寻址信息，查询为空就报 `No addressing information available`。
+
+原因链：
+
+1. **发送端**：`send.rs:61-64` —— `DiscoveryModeOption::Default` + `ticket_type == Id` 时才挂 `PkarrPublisher::n0_dns()`，把本端地址（home relay + 直连地址）发布到 n0 的 pkarr DNS。这个发布是**异步的**，`start_share_items` 返回 ticket 时发布很可能还没传播完成。
+2. **接收端**：`receive.rs:42` —— 只有当 ticket 里 `relay_urls` 和 `ip_addrs` 都为空时才启用 DNS 查询；`fetch_metadata` 走的是 `receive.rs:286-304` 同样的逻辑。你的 Id ticket 正好落进这条路径。
+3. DNS 查询返回空 → `endpoint.connect` 直接失败 → `Connection failed: No addressing information available`。
+
+## 最可靠的修复：改用 `RelayAndAddresses` ticket
+
+让寻址信息直接内嵌在 ticket 里，接收端完全不需要 DNS 解析：
+
+```cpp
+// 原: dashbeam_send_start(paths, n, nullptr, on_event, nullptr);
+const char *opts = R"({"ticket_type":"RelayAndAddresses"})";
+int64_t h = dashbeam_send_start(paths.data(), paths.size(),
+                                opts, on_event, nullptr);
+```
+
+这样 ticket 自带 sender 的 home relay URL（和直连地址），`receive.rs:42` 的判断不成立，接收端直接连 relay，不依赖 pkarr/DNS 传播。代价是 ticket 更长、会泄露 relay/地址信息（对 CLI 场景无所谓）。
+
+注意：`RelayAndAddresses`/`Relay` 需要 endpoint 已连上 home relay 才有意义。我没能完全确认 `run_share_session`（`engine/protocol/src/send.rs`）是否在生成 ticket 前等待 relay 上线 —— 如果 ticket 里没有 relay URL，可以让 CLI 在 `share-ready` 后稍等再用，或检查 `SendResult` 构造处的等待逻辑。
+
+## 如果必须继续用 `Id` ticket
+
+- 在 CLI 收到 `share-ready` 后**延迟几秒**再把 ticket 给接收端，等 pkarr 发布传播（n0 DNS 有 TTL，接收端首次解析还可能被 DNS 缓存坑到）。
+- 确认接收端 `discovery_mode` 也是 `Default`——如果 GUI/接收方配置了自定义 pkarr relay，它不会去查 n0 DNS，永远解析不到。
+- 确认接收端所在网络能解析 `dns.iroh.link` 的 TXT 记录（企业 DNS/防火墙可能拦掉；n0 DNS 依赖标准 DNS TXT 查询）。
+- 确认发送端 `relay_mode` 不是 `disabled` —— 纯直连场景下发布的地址仍应可被解析，但如果发送端完全离线则无解。
+
+建议：CLI 直接默认用 `RelayAndAddresses`，把 `Id` 留给需要短码的场景。
+## Q6
+给我添加一个ci 功能，要求能够编译出dashbeam-send.exe和dashbeam_ffi.dll库
+### Answer
+User wants a CI workflow (GitHub Actions presumably) to build dashbeam_ffi.dll and dashbeam-send.exe. I should check repo structure — existing .github workflows, whether cli/ dir exists, workspace setup. Quick look.Need to check an existing workflow for conventions (rust-toolchain, caching) and engine/Cargo.toml workspace members, whether cli/ dir exists, and publish.yml for Windows build patterns. Read test.yml or publish.yml briefly + engine/Cargo.toml.I have enough. Write a GitHub Actions workflow `.github/workflows/cli-windows.yml` that builds `dashbeam_ffi.dll` via cargo and `dashbeam-send.exe` via MSVC (cl). The CLI file lives at `cli/dashbeam-send.cpp` (proposed earlier) and header at `engine/ffi/include/dashbeam.h`. Workflow on windows-latest, setup rust toolchain 1.91, cargo build --manifest-path engine/Cargo.toml -p dashbeam-ffi --release, then cl compile, upload artifacts.
+
+Answer concisely in Chinese with the workflow file.仓库已有 GitHub Actions 工作流（`.github/workflows/`），测试工作流用的是 `dtolnay/rust-toolchain@stable` + `swatinem/rust-cache`，统一沿用。新增一个 Windows 构建工作流即可：
+
+## `.github/workflows/cli-windows.yml`
+
+```yaml
+name: Windows CLI Build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build-cli:
+    name: Build dashbeam_ffi.dll + dashbeam-send.exe
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.91
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './engine -> target'
+
+      - name: Build dashbeam_ffi.dll
+        run: cargo build --manifest-path engine/Cargo.toml -p dashbeam-ffi --release
+        timeout-minutes: 30
+
+      - name: Build dashbeam-send.exe (MSVC)
+        # ilammy/msvc-dev-cmd 配置 cl.exe 环境（Windows runner 默认不带）
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile CLI
+        run: |
+          cl /std:c++17 /EHsc /utf-8 /O2 `
+             /I engine\ffi\include `
+             cli\dashbeam-send.cpp `
+             target\release\dashbeam_ffi.lib `
+             /Fe:dashbeam-send.exe `
+             /link ws2_32.lib
+        working-directory: ${{ github.workspace }}
+
+      - name: Stage artifacts
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item dashbeam-send.exe dist\
+          Copy-Item target\release\dashbeam_ffi.dll dist\
+          Copy-Item engine\ffi\include\dashbeam.h dist\
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashbeam-cli-windows-x64
+          path: dist/
+          retention-days: 14
+```
+
+## 说明
+
+- **`cargo build --manifest-path engine/Cargo.toml -p dashbeam-ffi --release`**：产出 `target/release/dashbeam_ffi.dll` + `dashbeam_ffi.lib`（import lib，MSVC 链接用）。前提是前面讨论的 `engine/ffi` crate 已加入 `engine/Cargo.toml` 的 `members`（`engine/Cargo.toml:2` 当前是 `[".", "protocol", "native", "wasm-io"]`，需加 `"ffi"`）。
+- **`ilammy/msvc-dev-cmd@v1`**：初始化 MSVC 环境，之后 `cl` 直接可用。`ws2_32.lib` 视你的 FFI/CRT 需要，通常可去掉。
+- **缓存**：`swatinem/rust-cache` 的 `workspaces: './engine -> target'` 与 `test.yml:22` 保持一致。
+- **产物**：三个文件打包为一个 artifact —— `dashbeam-send.exe`（CLI）、`dashbeam_ffi.dll`（运行依赖）、`dashbeam.h`（给其他 C++ 项目用）。下载解压到同一目录即可运行。
+- 若要给 C++ 侧安全的 panic 语义，记得把 `engine/Cargo.toml:64` 的 `panic = "abort"` 改掉或按前面讨论处理，否则 DLL 内任何 panic 会终止宿主进程。
+
+如果需要矩阵构建（x64/arm64）或把产物挂到 GitHub Release，在这个 workflow 上加 `matrix` 和 `softprops/action-gh-release` 步骤即可。
+## Q7
+添加 matrix 和 softprops/action-gh-release 步骤
+### Answer
+Update workflow: add matrix for x64 and arm64 Windows targets, and a release step using softprops/action-gh-release on tags. Rust cross-compile to aarch64-pc-windows-msvc requires adding target and MSVC arm64 libs — ilammy/msvc-dev-cmd supports arch param. cl can target arm64 via host x64 cross. cargo target aarch64-pc-windows-msvc needs rustup component. Keep it: matrix arch: [x64, arm64], map rust target triple and msvc arch.更新后的 workflow —— 增加 x64/arm64 matrix 和 tag 触发时的 GitHub Release 发布：
+
+## `.github/workflows/cli-windows.yml`
+
+```yaml
+name: Windows CLI Build
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: write   # action-gh-release 需要
+
+jobs:
+  build-cli:
+    name: Build ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            rust_target: x86_64-pc-windows-msvc
+            msvc_arch: amd64
+            exe_suffix: x64
+          - name: windows-arm64
+            rust_target: aarch64-pc-windows-msvc
+            msvc_arch: amd64_arm64   # x64 主机交叉编译 arm64
+            exe_suffix: arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.91
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './engine -> target'
+          key: ${{ matrix.rust_target }}
+
+      - name: Build dashbeam_ffi.dll (${{ matrix.rust_target }})
+        run: |
+          cargo build --manifest-path engine/Cargo.toml `
+            -p dashbeam-ffi --release --target ${{ matrix.rust_target }}
+        timeout-minutes: 30
+
+      - name: Setup MSVC (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Compile dashbeam-send.exe
+        run: |
+          cl /std:c++17 /EHsc /utf-8 /O2 `
+             /I engine\ffi\include `
+             cli\dashbeam-send.cpp `
+             target\${{ matrix.rust_target }}\release\dashbeam_ffi.lib `
+             /Fe:dashbeam-send-${{ matrix.exe_suffix }}.exe
+
+      - name: Stage artifacts
+        run: |
+          $d = "dist-${{ matrix.exe_suffix }}"
+          New-Item -ItemType Directory -Force $d | Out-Null
+          Copy-Item "dashbeam-send-${{ matrix.exe_suffix }}.exe" "$d\dashbeam-send.exe"
+          Copy-Item "target\${{ matrix.rust_target }}\release\dashbeam_ffi.dll" "$d\"
+          Copy-Item "engine\ffi\include\dashbeam.h" "$d\"
+          Compress-Archive -Path "$d\*" -DestinationPath "dashbeam-cli-${{ matrix.name }}.zip"
+          Get-ChildItem $d, "dashbeam-cli-${{ matrix.name }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashbeam-cli-${{ matrix.name }}
+          path: dist-${{ matrix.exe_suffix }}/
+          retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dashbeam-cli-${{ matrix.name }}.zip
+          generate_release_notes: true
+```
+
+## 说明
+
+- **matrix**：`x64` 用 `x86_64-pc-windows-msvc`；`arm64` 用 `aarch64-pc-windows-msvc` + `ilammy/msvc-dev-cmd` 的 `amd64_arm64` 交叉编译器（GitHub Windows runner 是 x64，无原生 arm64 工具链）。`fail-fast: false` 保证一个架构失败不影响另一个。
+- **target 目录**：指定 `--target` 后 cargo 产物在 `target/<triple>/release/`，注意 `.lib` 路径相应变化。
+- **Release**：仅 tag（`v*`）触发，`contents: write` 权限已加。zip 命名如 `dashbeam-cli-windows-x64.zip`，里面 `dashbeam-send.exe` + `dashbeam_ffi.dll` + `dashbeam.h` 平铺，解压即用。
+- **注意**：arm64 的 `cl` 输出文件名不能直接叫 `dashbeam-send.exe`（runner 无法运行验证但编译没问题），stage 阶段统一改名是为了让 zip 包内文件名一致。如果 arm64 构建因依赖（如 ring/aws-lc-rs 类原生依赖）交叉编译失败，先从 matrix 里去掉 arm64，只保留 x64。
+
+
+# [DeepWiki Q&A with Code Context for Repository: tonyantony300/dashbeam](https://deepwiki.com/search/_fa2cd547-e1e7-44fe-b0c9-cb5398a03939?mode=deep)
+## Q1
+传输界面速度展示逻辑
+### Answer
+User asks in Chinese: "传输界面速度展示逻辑" — the logic for displaying transfer speed in the transfer UI. Search repo dashbeam.I have enough. Maybe quickly check how engine emits speed events — the SpeedMeter usage. Enough context to answer. Could check where record/emit happens, but can summarize. Let me quickly check the receiver side too? Keep it concise. Maybe grep for SpeedMeter usage.Look at send.rs usage briefly.Read relevant lines of send.rs and receive.rs around speed emission quickly — grep with context isn't available; use read_file? grep_search doesn't give line numbers. I have one iteration left. Read send.rs partially — but file may be large. Try reading targeted via read_file on progress.rs header (to get MIN_WINDOW_SECS, window size) plus send.rs matches location. Just read progress.rs fully (already saw most) and send.rs first ~120 lines? Better: read progress.rs lines 1-33 for constants, and send.rs around progress emit — can't know lines. Use read_file with send.rs first 200 lines and receive.rs similarly — two reads in parallel.Produce answer in Chinese explaining the speed display logic: engine-side sliding-window SpeedMeter, wire format, frontend parsing, UI rendering. Cite files/lines.传输速度展示由**引擎统一计算、前端只做渲染**的分层设计实现。核心原则是两端（发送方/接收方）用同一套算法算速度，前端不重新平滑或估算。
+
+## 1. 引擎侧：`SpeedMeter` 滑动窗口测速
+
+`engine/protocol/src/progress.rs` 定义了共享的进度统计逻辑：
+
+- `SpeedMeter` 是一个**滑动窗口**测速器（默认窗口 `SPEED_WINDOW_SECS = 3.0` 秒），维护 `(时间, 累计字节数)` 样本队列。累计平均值会被慢启动拖垮、也不会在停顿时回落，所以改用窗口。 dashbeam:44-57 
+- `record()` 每次写入时清理超出窗口的旧样本。 dashbeam:59-71 
+- `bytes_per_sec_at(now_secs)` 用窗口首尾样本差值除以耗时计算速率；`now_secs` 会延伸到"当下"，所以传输卡顿时速度会自然衰减到 0。窗口耗时小于 `MIN_WINDOW_SECS = 0.1` 秒时返回 0，避免把发送缓冲区的瞬时突发当成真实速率。 dashbeam:75-87 dashbeam:12-22 
+
+- 速度只统计**用户 payload 字节**：`split_child_sizes` 把 hash-seq root 和集合元数据从计数字节中剔除（`FIRST_PAYLOAD_BLOB_INDEX = 2`），保证显示的速度反映实际文件传输而非协议开销。 dashbeam:8-31 
+
+## 2. 事件节流与线格式
+
+- 进度事件最多每 `PROGRESS_MIN_BYTES = 1MB` 或每 `PROGRESS_MIN_SECS = 0.2s` 发一次（先到为准）。 dashbeam:18-22 
+- 线格式是 `<bytes>:<total>:<speed×1000>` 的字符串，发送方用 `transfer-progress`、接收方用 `receive-progress` 事件名，两端共用 `format_progress_payload`。 dashbeam:291-294 
+
+## 3. 前端解析：`parseProgressPayload`
+
+`frontend/src/lib/transfer-events.ts` 刻意**不做二次平滑**（文件头注释说明引擎已经做过窗口处理，UI 再平均只会引入延迟）：
+
+- 速度从整数除以 1000 还原，`Math.max(..., 0)` 把负值钳为 0。 dashbeam:47-49 
+- ETA 由剩余字节 ÷ 速度得出；速度为 0 或已传完时为 `undefined`，UI 就不显示 ETA。 dashbeam:50-53 
+
+## 4. UI 更新节奏
+
+`useSender` 把事件存进 `latestProgressRef`，再用 50ms 的 `setInterval` 以节流方式把最新值写入 React state —— 事件可能很频繁，但渲染被限制在 20fps。 dashbeam:277-300 dashbeam:321-326 
+
+## 5. 展示：`formatSpeed`
+
+`frontend/src/components/common/TransferProgressBar.tsx` 的 `formatSpeed`：≥1 MB/s 显示 `x.xx MB/s`，否则 `x.xx KB/s`（均为二进位制 1024）。移动端渲染在环形进度条中心，桌面端渲染在分段进度条下方的 "Speed: ..." 行。 dashbeam:9-17 dashbeam:196-204 
+
+传输完成后的成功页另有自己的 `formatSpeed`/`calculateAverageSpeed`，显示的是**全程平均速度**（文件大小 ÷ 耗时），与传输中的瞬时窗口速度不同；停止的传输显示 `NA`。 dashbeam:25-36 dashbeam:148-158 
+
+## 整体数据流
+
+```mermaid
+flowchart LR
+    Engine["引擎 SpeedMeter<br/>(3s 滑动窗口)"] -->|"bytes:total:speed×1000 字符串<br/>≥1MB 或 ≥0.2s 才发"| Parse["parseProgressPayload<br/>(还原速度、算 ETA)"]
+    Parse --> Ref["latestProgressRef"]
+    Ref -->|"50ms interval 节流"| State["setTransferProgress (React state)"]
+    State --> UI["TransferProgressBar<br/>formatSpeed → MB/s / KB/s"]
+```
+
+一个未完全验证的点：`SpeedMeter` 在 `send.rs`/`receive.rs` 中的具体调用位置（何时 `record`、何处 emit）我只确认了存在调用，没有读到具体行号；如需看引擎侧采样时机，可查看这两个文件中 `SpeedMeter` 相关代码。
+### Citations
+**File:** engine/protocol/src/progress.rs (L8-31)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+
+/// A window shorter than this is send-buffer noise rather than a transfer rate.
+const MIN_WINDOW_SECS: f64 = 0.1;
+
+/// Speed is averaged over this many seconds on both sides.
+pub const SPEED_WINDOW_SECS: f64 = 3.0;
+
+/// Progress is emitted at most once per this many bytes ...
+pub const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+
+/// ... or once per this many seconds, whichever comes first.
+pub const PROGRESS_MIN_SECS: f64 = 0.2;
+
+/// Payload byte counts derived from a hash-seq `sizes` vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadSizes {
+    /// Hash-seq root + collection metadata: transferred, but not user payload.
+    pub overhead_bytes: u64,
+    /// Sum of the actual file sizes.
+    pub payload_bytes: u64,
+}
+```
+**File:** engine/protocol/src/progress.rs (L44-57)
+```rust
+/// Sliding-window speed estimate fed with cumulative byte counts — a cumulative
+/// average never recovers from a slow start nor drops on a stall.
+pub struct SpeedMeter {
+    window_secs: f64,
+    samples: VecDeque<(f64, u64)>,
+}
+
+impl SpeedMeter {
+    pub fn new(window_secs: f64) -> Self {
+        Self {
+            window_secs,
+            samples: VecDeque::new(),
+        }
+    }
+```
+**File:** engine/protocol/src/progress.rs (L59-71)
+```rust
+    pub fn record(&mut self, at_secs: f64, cumulative_bytes: u64) {
+        self.samples.push_back((at_secs, cumulative_bytes));
+        let cutoff = at_secs - self.window_secs;
+        while self.samples.len() > 1 {
+            let Some(&(front_secs, _)) = self.samples.front() else {
+                break;
+            };
+            if front_secs >= cutoff {
+                break;
+            }
+            self.samples.pop_front();
+        }
+    }
+```
+**File:** engine/protocol/src/progress.rs (L75-87)
+```rust
+    pub fn bytes_per_sec_at(&self, now_secs: f64) -> f64 {
+        let (Some(&(oldest_secs, oldest_bytes)), Some(&(newest_secs, newest_bytes))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
+
+        let elapsed = now_secs.max(newest_secs) - oldest_secs;
+        if elapsed < MIN_WINDOW_SECS {
+            return 0.0;
+        }
+        newest_bytes.saturating_sub(oldest_bytes) as f64 / elapsed
+    }
+```
+**File:** engine/protocol/src/progress.rs (L291-294)
+```rust
+/// Wire format shared by `transfer-progress` and `receive-progress`.
+pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
+    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
+}
+```
+**File:** frontend/src/lib/transfer-events.ts (L47-49)
+```typescript
+	const speedBps = Math.max(speedInt / 1000, 0)
+	const percentage =
+		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
+```
+**File:** frontend/src/lib/transfer-events.ts (L50-53)
+```typescript
+	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
+	const etaSeconds =
+		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
+
+```
+**File:** frontend/src/hooks/useSender.ts (L277-300)
+```typescript
+					progressUpdateIntervalRef.current = setInterval(() => {
+						const currentViewState = useSenderStore.getState().viewState
+						if (latestProgressRef.current && currentViewState === 'SHARING') {
+							setTransferProgress(latestProgressRef.current)
+						}
+					}, 50)
+				} else {
+					setViewState('TRANSPORTING')
+					setTransferProgress(null)
+					setTransferMetadata(null)
+					wasManuallyStoppedRef.current = false
+
+					if (progressUpdateIntervalRef.current) {
+						clearInterval(progressUpdateIntervalRef.current)
+					}
+					progressUpdateIntervalRef.current = setInterval(() => {
+						const currentViewState = useSenderStore.getState().viewState
+						if (
+							latestProgressRef.current &&
+							currentViewState === 'TRANSPORTING'
+						) {
+							setTransferProgress(latestProgressRef.current)
+						}
+					}, 50)
+```
+**File:** frontend/src/hooks/useSender.ts (L321-326)
+```typescript
+						// The engine already windows the speed and derives the ETA
+						// from it; averaging again here only adds lag.
+						const progress = parseProgressPayload(event.payload as string)
+						if (progress) {
+							latestProgressRef.current = progress
+						}
+```
+**File:** frontend/src/components/common/TransferProgressBar.tsx (L9-17)
+```typescript
+export function formatSpeed(speedBps: number): string {
+	const mbps = speedBps / (1024 * 1024)
+	const kbps = speedBps / 1024
+	if (mbps >= 1) {
+		return `${mbps.toFixed(2)} MB/s`
+	} else {
+		return `${kbps.toFixed(2)} KB/s`
+	}
+}
+```
+**File:** frontend/src/components/common/TransferProgressBar.tsx (L196-204)
+```typescript
+				<div className="flex items-center justify-between text-xs text-muted-foreground">
+					<span>
+						{t('common:transfer.speed')}: {formatSpeed(progress.speedBps)}
+					</span>
+					<span>
+						{(progress.bytesTransferred / (1024 * 1024)).toFixed(2)} MB /{' '}
+						{(progress.totalBytes / (1024 * 1024)).toFixed(2)} MB
+					</span>
+				</div>
+```
+**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L25-36)
+```typescript
+function formatSpeed(bytesPerSecond: number): string {
+	if (bytesPerSecond === 0) return 'NA'
+
+	const mbps = bytesPerSecond / (1024 * 1024)
+	const kbps = bytesPerSecond / 1024
+
+	if (mbps >= 1) {
+		return `${mbps.toFixed(2)} MB/s`
+	} else {
+		return `${kbps.toFixed(2)} KB/s`
+	}
+}
+```
+**File:** frontend/src/components/common/TransferSuccessScreen.tsx (L148-158)
+```typescript
+					<div className="flex justify-between items-center">
+						<span className="text-sm font-medium mr-2">
+							{t('common:transfer.avgSpeed')}:
+						</span>
+						<span className="text-sm">
+							{wasStopped
+								? 'NA'
+								: formatSpeed(
+										calculateAverageSpeed(metadata.fileSize, metadata.duration)
+									)}
+						</span>
+```
+## Q2
+对于多个超大文件是怎么传输的，一个一个还是打包为一个文件
+### Answer
+Search for collection / multi-file transfer in protocol.Need to confirm: collection = HashSeq blob listing child blobs; files transferred as separate blobs in one stream (sequential within get request). Check send.rs import to confirm each file imported as separate blob, and README note about concatenation? iroh-blobs hash seq transfers each blob; large files may be chunked internally. Read engine/native/src/import.rs and send.rs relevant parts.Answer: not packed into one file — each file imported as separate blob (BlobFormat::Raw), bundled into a Collection + HashSeq; receiver downloads all child blobs via one get request over a single QUIC connection; export writes each back to disk. Check export.rs briefly to confirm per-file export — maybe skip, I have enough. Mention resume granularity per blob.**不打包成单文件** —— 多个文件（或文件夹）作为**一个集合（Collection）里的多个独立 blob** 传输，共享同一条连接，但每个文件保持独立寻址、独立校验。
+
+## 具体机制
+
+### 1. 发送侧：每个文件一个 blob
+
+`import_paths`（`engine/native/src/import.rs`）把每个文件单独导入 blob store（`BlobFormat::Raw`），得到一个 `(文件名, hash)` 列表；然后构造一个 `Collection`（文件名 → blob hash 的映射）并把它本身也存为 blob。 dashbeam:20-24 dashbeam:85-92 
+
+集合再挂到一条 **HashSeq**（按顺序列出所有子 blob 哈希的清单）下，ticket 里只带这一个根哈希（`BlobFormat::HashSeq`）。所以**每个分享（哪怕单文件）都是一个 collection**：blob 0 是 hash-seq root，blob 1 是集合元数据，从 index 2 开始才是真正的文件 payload。 dashbeam:216-216 dashbeam:8-10 
+
+```mermaid
+flowchart TD
+    Ticket["Ticket → HashSeq root hash"] --> HS["HashSeq (blob 0)<br/>子 blob 哈希列表"]
+    HS --> Meta["Collection metadata (blob 1)<br/>文件名→哈希映射"]
+    HS --> F1["file1 (blob 2)"]
+    HS --> F2["file2 (blob 3)"]
+    HS --> F3["file3 (blob 4)"]
+```
+
+### 2. 传输方式：一条连接、一个 get 请求，按序拉取全部子 blob
+
+接收侧（`engine/protocol/src/receive.rs`）先下载 hash-seq 和 `sizes` 向量算出总 payload，然后用 `db.remote().execute_get(connection, local.missing())` 发起**一次** get 请求，流式按序取回所有缺失的子 blob —— 所有文件复用同一条 QUIC 连接（QUIC 多路复用、共享拥塞控制），而不是每个文件建一条连接。 dashbeam:155-177 
+
+因此从进度角度看它是"一个传输"：进度条的总字节是所有文件之和，速度跨文件连续统计；但落盘时每个 blob 按集合里的文件名还原成独立文件，绝不是接收方拿到一个拼起来的大文件。
+
+### 3. 这么做的收益
+
+- **粒度级断点续传**：`local.missing()` 只请求缺失的 blob/分块。传了 3 个大文件断掉后重连，已完成的文件直接跳过（`local.is_complete()` 时甚至不连），只补缺口。 dashbeam:134-135 dashbeam:224-231 
+- **独立校验**：每个 blob 由自己的 BLAKE3 哈希寻址，逐块校验，单文件损坏不会污染其他文件。
+- **广播**：`completed_peers` 计数表明同一个 collection 可同时服务多个接收者，每个 peer 只拉自己缺的部分。 dashbeam:167-170 
+
+### 与"打包"的对比
+
+唯一接近"打包"的是集合元数据本身（文件名列表），它只是几十字节的描述符。对超大文件，iroh-blobs 内部还会把单个大 blob 按 chunk 切分校验/续传，但逻辑上仍是**逐文件传输**，不是 tar 式合并。
+### Citations
+**File:** engine/native/src/import.rs (L20-24)
+```rust
+pub async fn import_paths(
+    paths: Vec<PathBuf>,
+    db: &Store,
+) -> anyhow::Result<(TempTag, u64, Collection)> {
+    let mut entries: Vec<(String, TempTag, u64)> = Vec::new();
+```
+**File:** engine/native/src/import.rs (L85-92)
+```rust
+    let (collection, tags) = entries
+        .into_iter()
+        .map(|(name, tag, _)| ((name, tag.hash()), tag))
+        .unzip::<_, _, Collection, Vec<_>>();
+
+    let temp_tag = collection.clone().store(db).await?;
+    drop(tags);
+    Ok((temp_tag, total_size, collection))
+```
+**File:** engine/protocol/src/send.rs (L167-170)
+```rust
+    /// Peers that pulled the entire payload. A broadcast share serves many,
+    /// and the count is the only way a history row can describe the session
+    /// rather than just its first peer.
+    pub completed_peers: Arc<AtomicUsize>,
+```
+**File:** engine/protocol/src/send.rs (L216-216)
+```rust
+    let ticket = BlobTicket::new(addr, hash, BlobFormat::HashSeq);
+```
+**File:** engine/protocol/src/progress.rs (L8-10)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+```
+**File:** engine/protocol/src/receive.rs (L134-135)
+```rust
+    let (stats, total_files, payload_size, download_duration_ms) = if !local.is_complete() {
+        emit_event(app_handle, "receive-started");
+```
+**File:** engine/protocol/src/receive.rs (L155-177)
+```rust
+        let sizes_result =
+            get_hash_seq_and_sizes(&connection, &hash_and_format.hash, 1024 * 1024 * 32, None)
+                .await;
+
+        let (hash_seq, sizes) = match sizes_result {
+            Ok((hash_seq, sizes)) => (hash_seq, sizes),
+            Err(e) => {
+                tracing::error!("Failed to get sizes: {:?}", e);
+                tracing::error!("Error type: {}", std::any::type_name_of_val(&e));
+                return Err(show_get_error(e).into());
+            }
+        };
+        // `sizes` holds children only (entry 0 is the collection metadata), but
+        // the get stream counts the hash-seq root and that blob too — subtract
+        // them to leave the same "file bytes" the sender reports.
+        let root_bytes = (hash_seq.len() as u64).saturating_mul(32);
+        let split = split_child_sizes(root_bytes, &sizes);
+        let payload_size = split.payload_bytes;
+        let total_files = (sizes.len().saturating_sub(1)) as u64;
+
+        emit_progress_event(app_handle, 0, payload_size, 0.0);
+
+        let get = db.remote().execute_get(connection, local.missing());
+```
+**File:** engine/protocol/src/receive.rs (L224-231)
+```rust
+    } else {
+        let total_files = local.children().unwrap() - 1;
+        let payload_bytes = 0;
+
+        emit_event(app_handle, "receive-started");
+        emit_event(app_handle, "receive-completed");
+
+        (Stats::default(), total_files, payload_bytes, 0)
+```
+## Q3
+发送端能够展示每个文件的传输进度吗
+### Answer
+Check if sender tracks per-file progress. Search for per-file progress events.Check send.rs progress emission — does sender know which blob is being sent? Grep for SpeedMeter/progress in send.rs.Read send.rs around progress emission to see if per-blob info is available.Check ShareProgress (ledger) — blob_started/blob_progress record per-blob index. Does it know file boundaries? Check progress.rs ShareProgress briefly.Answer: No per-file progress currently. Sender tracks per-blob index internally via ledger.blob_started(key, m.index, m.size) and blob_progress(key, m.end_offset), but emits only aggregate bytes:total:speed. Could be extended since m.index maps to files via collection ordering.**目前不能** —— 发送端只在内部按 blob 记账，对外只发**聚合进度**，前端没有逐文件进度可显示。
+
+## 现状
+
+### 引擎内部其实知道每个 blob（文件）的进度
+
+`send.rs` 的 `SessionProgress.ledger`（`ShareProgress`）按 `(connection_id, request_id)` + blob index 记账：
+
+- `RequestUpdate::Started` 时调用 `session.ledger.blob_started(key, m.index, m.size)` —— 拿到了**当前在传哪个 blob（`m.index`）及其大小**。 dashbeam:439-457 
+- `RequestUpdate::Progress` 时调用 `session.ledger.blob_progress(key, m.end_offset)` —— 拿到该 blob 的字节偏移。 dashbeam:458-483 
+
+由于 collection 里 blob index 与文件一一对应（index ≥ 2 为 payload 文件，顺序即 collection 中的文件顺序），引擎**具备推导"正在传第几个文件、该文件传了多少"所需的全部信息**。 dashbeam:8-10 
+
+### 但发出的事件只有聚合值
+
+`emit_session_progress` 把 ledger snapshot 聚合成 `bytes:total:speed` 三字段发出，payload 里**不含 blob index 或文件名**。 dashbeam:334-342 dashbeam:291-294 
+
+前端 `transfer-progress` 事件的 schema 也只有 `bytesTransferred / totalBytes / speedBps / etaSeconds`，UI 只能显示总进度条。 dashbeam:47-53 
+
+## 如果要支持逐文件进度
+
+改动是可行的，因为数据都在：
+
+1. `emit_session_progress` 在发事件时从 ledger 取出当前活跃 blob 的 `index` 和 `end_offset`，把 `index → 文件名` 映射（发送侧有 collection）连同该文件已传字节一起塞进 payload；
+2. `parseProgressPayload` 扩展字段解析；
+3. UI 增加当前文件名 + 文件序号（"第 3/7 个文件"）或逐文件进度条。
+
+注意两点复杂性：blob 的请求顺序不一定严格串行（接收端按 `missing()` 范围拉取，多个请求可交错），以及广播场景下多个 peer 同时拉不同文件时"当前文件"不唯一——展示上需要选定某个 peer 或取聚合口径。这两点我未在代码中验证现有处理，属于设计时需要确认的地方。
+### Citations
+**File:** engine/protocol/src/send.rs (L334-342)
+```rust
+fn emit_session_progress(app_handle: &AppHandle, session: &SessionProgress, at_secs: f64) {
+    let snapshot = session.ledger.snapshot();
+    emit_progress_event(
+        app_handle,
+        snapshot.bytes,
+        snapshot.total,
+        session.speed.bytes_per_sec_at(at_secs),
+    );
+}
+```
+**File:** engine/protocol/src/send.rs (L439-457)
+```rust
+                                    iroh_blobs::provider::events::RequestUpdate::Started(m) => {
+                                        let active_count = {
+                                            let mut session = session_task.lock().await;
+                                            let at_secs = session.now_secs();
+                                            session.clock.mark_start(at_secs);
+                                            session.ledger.blob_started(key, m.index, m.size);
+                                            session.ledger.active_requests()
+                                        };
+
+                                        if !transfer_started {
+                                            emit_active_connection_count(&app_handle_task, active_count);
+
+                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                                emit_event(&app_handle_task, "transfer-started");
+                                            }
+
+                                            transfer_started = true;
+                                        }
+                                    }
+```
+**File:** engine/protocol/src/send.rs (L458-483)
+```rust
+                                    iroh_blobs::provider::events::RequestUpdate::Progress(m) => {
+                                        if !transfer_started {
+                                            let active_count = {
+                                                let mut session = session_task.lock().await;
+                                                let at_secs = session.now_secs();
+                                                session.clock.mark_start(at_secs);
+                                                session.ledger.ensure_request(key);
+                                                session.ledger.active_requests()
+                                            };
+
+                                            emit_active_connection_count(&app_handle_task, active_count);
+
+                                            if !has_emitted_started_task.swap(true, Ordering::SeqCst) {
+                                                emit_event(&app_handle_task, "transfer-started");
+                                            }
+                                            transfer_started = true;
+                                        }
+
+                                        let mut session = session_task.lock().await;
+                                        session.ledger.blob_progress(key, m.end_offset);
+                                        let at_secs = session.now_secs();
+                                        let bytes = session.ledger.snapshot().bytes;
+                                        if session.record(at_secs, bytes) {
+                                            emit_session_progress(&app_handle_task, &session, at_secs);
+                                        }
+                                    }
+```
+**File:** engine/protocol/src/progress.rs (L8-10)
+```rust
+/// Blob indices below this are overhead, not payload: 0 is the hash-seq root,
+/// 1 the collection metadata. Every share is a collection, single files included.
+pub const FIRST_PAYLOAD_BLOB_INDEX: u64 = 2;
+```
+**File:** engine/protocol/src/progress.rs (L291-294)
+```rust
+/// Wire format shared by `transfer-progress` and `receive-progress`.
+pub fn format_progress_payload(bytes: u64, total: u64, speed_bps: f64) -> String {
+    format!("{}:{}:{}", bytes, total, (speed_bps * 1000.0) as i64)
+}
+```
+**File:** frontend/src/lib/transfer-events.ts (L47-53)
+```typescript
+	const speedBps = Math.max(speedInt / 1000, 0)
+	const percentage =
+		totalBytes > 0 ? Math.min((bytesTransferred / totalBytes) * 100, 100) : 0
+	const bytesRemaining = Math.max(totalBytes - bytesTransferred, 0)
+	const etaSeconds =
+		speedBps > 0 && bytesRemaining > 0 ? bytesRemaining / speedBps : undefined
+
+```
